@@ -31,7 +31,8 @@ def create_controller(ctx, port, config):
             if existing.binding.ctx is not ctx:
                 raise ValueError('participation port already attached to another plugin lifetime')
             return existing
-        policy = SocialPolicy(config, owner_id=port.owner_id, groups=port.groups)
+        policy = SocialPolicy(config, owner_id=port.owner_id, groups=port.groups,
+                              dm_target_allowed=getattr(port, 'dm_target_allowed', None))
         binding = SocialBinding(ctx)
         try:
             controller = SocialController(port, policy, binding)

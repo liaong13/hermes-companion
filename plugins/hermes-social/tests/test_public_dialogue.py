@@ -1,4 +1,5 @@
 """Authored synthetic scenarios for context, turn-taking and bursts; no chat imports."""
+import json
 import unittest
 
 import support
@@ -39,6 +40,24 @@ class PublicDialogue(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.current())
         self.social.recall('group:20001','1')
         self.assertFalse(view.current())
+
+    async def test_current_recipient_and_other_member_contribution_keep_separate_authorship(self):
+        self.observe('我在征集合成展览的候选地点。','request-a',user='10001')
+        self.social.record_self('group:20001','想听听哪位成员提议地点？','ask',reply_to_message_id='request-a')
+        self.observe('我提议星桥展厅，等待发起者决定。','contribution-b',user='10002')
+        current = self.observe('我采用刚才的提议，请明确是谁提出的。','adoption-a',user='10001')
+        current.user_name = '合成发起者'
+        view = self.social.prepare_public_context(current)
+        payload = json.loads(view.text[view.text.index('{'):])
+        recipient = payload['current_request']
+        self.assertEqual(recipient,dict(message_id='adoption-a',speaker=payload['current_speaker'],
+                                       display_name='合成发起者'))
+        rows = {row['message_id']:row for row in payload['messages']}
+        self.assertEqual(rows['request-a']['speaker'],recipient['speaker'])
+        self.assertNotEqual(rows['contribution-b']['speaker'],recipient['speaker'])
+        exchange = payload['recent_exchange']
+        self.assertEqual(exchange['request_id'],'request-a')
+        self.assertNotIn('星桥展厅',exchange['member_message'])
 
     async def test_imperative_question_survives_other_members_exchange(self):
         original=self.observe('请继续合成活动的安排','1')
@@ -85,7 +104,7 @@ class PublicDialogue(unittest.IsolatedAsyncioTestCase):
         prompt=self.social.prepare_public_context(self.port.dispatched[0]).text
         self.assertIn('对称图形',prompt)
         self.assertIn('合成纸模型',prompt)
-        self.assertFalse(self.ctx.calls)
+        self.assertEqual(len(self.ctx.calls),1)
 
     async def test_sharing_has_opportunity_but_other_member_address_does_not(self):
         sharing=self.observe('我完成了合成纸模型的第一张示意图','1')

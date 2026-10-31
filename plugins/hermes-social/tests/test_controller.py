@@ -246,7 +246,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(events[-1].internal)
         self.assertTrue(self.port.optional_valid(events[-1].source))
         self.assertFalse(self.port.optional_valid(copy.copy(events[-1].source)))
-        self.assertFalse(self.ctx.calls)
+        self.assertEqual(len(self.ctx.calls), 1)
+        self.assertIn('public_participation_selection', self.ctx.calls[0][0]['messages'][-1]['content'])
 
     async def test_optional_uses_ephemeral_speaker_aliases_not_qq_ids(self):
         first = event('露营天气怎么样？', mid='speaker-a', user='10001', name='同名')
@@ -321,6 +322,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         for reason in ['message', 'self', 'recall', 'pause']:
             item = event('大家觉得这个候选怎么样？', mid=reason)
             self.social.states['group:20001'].paused = False
+            self.social.observe(item)
             self.social.queue_ambient(item)
             await self.drain()
             self.assertTrue(self.port.optional_valid(item.source))
@@ -331,7 +333,9 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.port.optional_valid(item.source))
             self.assertEqual(self.port.invalidations[-1], 'group:20001')
         self.social.states['group:20001'].paused = False
-        self.social.queue_ambient(event('大家觉得最后候选怎么样？', mid='last'))
+        last = event('大家觉得最后候选怎么样？', mid='last')
+        self.social.observe(last)
+        self.social.queue_ambient(last)
         await self.drain()
         self.ctx.unload()
         self.assertFalse(self.social.active)

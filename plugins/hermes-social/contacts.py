@@ -45,6 +45,7 @@ class ContactLedger:
                 db.close()
 
     def restore(self,states,*,expire=False):
+        changes = []
         with self.connection() as db:
             if expire:
                 db.execute("UPDATE attempts SET status='no_response' WHERE expires<=? AND status='acknowledged'",
@@ -57,6 +58,13 @@ class ContactLedger:
                 elif row['last_attempt']>=state.last_attempt: state.day,state.daily=row['day'],row['daily']
                 if row['last_attempt']>=state.last_attempt:
                     state.last_attempt,state.unanswered=row['last_attempt'],bool(row['unanswered'])
+            if expire:
+                # Replaying a stable no-response record also repairs a crash
+                # between expiry and publishing feedback into the activity DB.
+                changes = [(r['chat'], r['reference'], r['recipient'], 'no_response') for r in db.execute(
+                    "SELECT chat,reference,recipient FROM attempts WHERE status='no_response' ORDER BY created DESC LIMIT 128")
+                    if r['chat'] in states]
+        return changes
 
     def contains(self,reference):
         with self.connection() as db:
@@ -77,7 +85,7 @@ class ContactLedger:
                 daily=max(daily,row['daily'] if row['day']==day else 0)
                 last=max(last,row['last_attempt'])
                 unanswered=unanswered or bool(row['unanswered'])
-            if (kind not in {'idle','agreement'} or daily>=limit or unanswered or now-last<interval
+            if (kind not in {'idle','agreement','activity','dialogue'} or daily>=limit or unanswered or now-last<interval
                     or db.execute('SELECT 1 FROM attempts WHERE reference=?',(reference,)).fetchone() is not None):
                 raise ValueError('contact budget or one-shot reference consumed')
             db.execute('INSERT INTO attempts(id,chat,kind,reference,recipient,created,expires,status) VALUES (?,?,?,?,?,?,?,?)',

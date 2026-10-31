@@ -52,6 +52,8 @@ class FakeContext:
         self.migrate: Any = False
         self.calls = []
         self.response = {'speak': True, 'text': '顺着刚才的话题补充一点。'}
+        self.selection_response = None
+        self.grounding_response = {'supported': True, 'about_source': True}
         self.entered, self.release = asyncio.Event(), asyncio.Event()
         self.delayed = False
         self.resist_cancel = False
@@ -68,8 +70,20 @@ class FakeContext:
                     if not self.resist_cancel:
                         raise
                     await self.release.wait()
+            result = self.response
+            if 'social_source_grounding' in kwargs['messages'][-1]['content']:
+                result = self.grounding_response
+            if 'public_participation_selection' in kwargs['messages'][-1]['content']:
+                frame = json.loads(kwargs['messages'][-1]['content'])
+                result = self.selection_response
+                if result is None:
+                    # Default transport fixture preserves the old latest-turn
+                    # scenario. Semantic cases supply explicit model decisions.
+                    result = {'selected': frame['candidates'][-1]['ref'], 'assessments': [
+                        dict(candidate=row['ref'], audience='group', action='respond',
+                             topic=row['ref'], reason='sharing') for row in frame['candidates']]}
             return ('offline', 'same-host-model', SimpleNamespace(choices=[SimpleNamespace(
-                    message=SimpleNamespace(content=json.dumps(self.response, ensure_ascii=False)))], usage=None))
+                    message=SimpleNamespace(content=json.dumps(result, ensure_ascii=False)))], usage=None))
         self.llm = PluginLlm(plugin_id=self.plugin_id, policy_loader=lambda p: _TrustPolicy(plugin_id=p),
                              async_caller=provider)
 
@@ -218,6 +232,9 @@ class FakePort:
         sent = await self.send_idle(grant, offer.text, reserve, lambda: valid() and offer.current())
         offer.finish('notified' if sent else 'unknown')
         return sent
+
+    async def send_activity(self, grant, offer, consume, valid):
+        return await self.send_idle(grant, offer.text, consume, lambda: valid() and offer.current())
 
     def report_contact_feedback(self, chat, recipient, reference, status):
         self.feedback.append((chat,recipient,reference,status))

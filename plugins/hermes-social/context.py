@@ -45,6 +45,7 @@ class ContextRecord:
     sender_id: str = ''
     at_targets: tuple[str, ...] = ()
     reply_to_message_id: str | None = None
+    verified_reply_author_id: str | None = None
 
     def row(self):
         if (self.role not in {'self', 'member'} or not isinstance(self.display_name, str)
@@ -108,12 +109,13 @@ class ScopedContext:
 
 class RecentContext:
     """In-process, bounded real observations only; never reads profile files."""
-    def __init__(self):
+    def __init__(self, *, capacity=64):
+        self.capacity = capacity
         self._records = {}
 
     def append(self, record: ContextRecord):
         record.row()
-        self._records.setdefault(record.scope, deque(maxlen=64)).append(record)
+        self._records.setdefault(record.scope, deque(maxlen=self.capacity)).append(record)
 
     def read(self, scope: ContextScope):
         return tuple(self._records.get(scope, ()))[-16:]
@@ -124,12 +126,12 @@ class RecentContext:
 
     def recall(self, scope: ContextScope, message_id: str):
         self._records[scope] = deque((r for r in self.routing_history(scope)
-                                      if r.message_id != message_id), maxlen=64)
+                                      if r.message_id != message_id), maxlen=self.capacity)
 
     def remove_messages(self, scope: ContextScope, message_ids):
         rows = self.routing_history(scope)
         kept = [r for r in rows if r.message_id not in message_ids]
-        self._records[scope] = deque(kept, maxlen=64)
+        self._records[scope] = deque(kept, maxlen=self.capacity)
         return len(rows)-len(kept)
 
     def replace_text(self, scope: ContextScope, message_id: str, old_suffix: str, text: str) -> bool:

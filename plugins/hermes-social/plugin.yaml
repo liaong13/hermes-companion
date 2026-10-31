@@ -1,7 +1,7 @@
 name: hermes-social
 label: Hermes Internet Life
 kind: standalone
-version: 0.2.0
-description: Internet life runtime; currently provides scoped conversation and contact activities.
+version: 0.5.0
+description: Per-person group requests, reply orchestration and evidence-validated social methods.
 author: Hermes Companion contributors
 license: MIT

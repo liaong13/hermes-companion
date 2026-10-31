@@ -15,7 +15,8 @@ All generated homes, databases, logs, reports and transcripts remain in TMPDIR.
 A failing behavioral assertion exits 1 but still writes report.json. Infrastructure
 failures exit 2. --case all includes two questions, a continuous follow-up and two
 quiet negatives, then re-entry, identity and a short answer to a proven bot
-question, through the SAME real durable native gateway path.
+question, shared rules, multi-party corrections with and without addressing,
+and a fresh relative date through the SAME real durable native gateway path.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import argparse
 import asyncio
 from contextlib import ExitStack
 import copy
+from datetime import datetime, timedelta
 import importlib.util
 import json
 import os
@@ -33,13 +35,14 @@ import sys
 import tempfile
 import threading
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 sys.dont_write_bytecode = True
 
 
 CANARY = 'SYNTHETIC_PRIVATE_CONTEXT_CANARY_7d91b63a'
 TEST_SELF_NAME = '测试实例乙'
-FIXTURE_PROVENANCE = 'synthetic-authored-v2'
+FIXTURE_PROVENANCE = 'synthetic-authored-v5-with-explicit-historical-request-metadata'
 CASES = [
     ('first', '合成活动甲适合练习颜色辨认吗？', True),
     ('comparison', '合成活动甲和合成活动乙有什么区别？', True),
@@ -49,8 +52,19 @@ CASES = [
     ('reentry', '回到合成活动的比较，我想练习按编号排列，哪种更合适？', True),
     ('identity', '这个合成场景里，我如何称呼你？', True),
     ('answer_to_question', '选项乙', True),
+    ('legacy_followup', '选项乙', True),
     ('shared_context', '按合成计分规则，步骤丙和步骤丁各增加多少点？', True),
+    ('earlier_share', '我完成了纸模型的新折叠示意图，发现对称折法更省材料，想听听大家怎么看。', True),
+    ('collective_correction', '更正刚才的星桥展厅运输：日期应为周日，其余条件照旧。请接着整理目的地、日期、总箱数和分车安排。', True),
+    ('collective_addressed', '测试实例，更正刚才的星桥展厅运输：日期应为周日，其余条件照旧。请接着整理目的地、日期、总箱数和分车安排。', True),
+    ('turn_clock', '请按本轮当前日期写出明天的公历日期，并明确标注这是明天。', True),
+    ('source_attribution', '就采用合成成员乙提供的地点。请用一句话写出地点是谁提出的，以及现在是谁决定采用。', True),
+    ('independent_requests', '我问的是寄件甲，日期照旧。你现在已经知道我的目的地了吗？若不知道，请只问我缺的目的地。', True),
+    ('implicit_adoption', '第一轮就采用首个建议，下周二开始，帮我写个一句话安排。', True),
+    ('combined_requests', '我的独立算卡任务乙：每套五张，共两套。也请帮我算乙的总张数，请把我们两人的结果放在同一条回复里。', True),
+    ('request_clarification', '我的独立算卡任务丁：每套三张，共两套。请回答丁的总数，同时问清前一位丙件缺的箱数。', True),
 ]
+ENHANCED_ONLY = {'combined_requests','request_clarification'}
 
 
 def arguments():
@@ -63,6 +77,7 @@ def arguments():
     parser.add_argument('--plugin-root', type=Path, help='explicit reviewed installed NapCat directory; defaults to repository source')
     parser.add_argument('--social-plugin-root', type=Path, help='reviewed social plugin directory; defaults beside NapCat')
     parser.add_argument('--shared-allowlist', action='store_true', help='verify participation derives only from allowed_groups, with no idle targets')
+    parser.add_argument('--enhanced-social', action='store_true', help='exercise scoped request state, combined replies and ACK coverage')
     parser.add_argument('--managed', action='store_true', help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -153,9 +168,14 @@ def configure(home, route, args):
             'channels': {'napcat': {'enabled': True,
                 'public_self': {'name': TEST_SELF_NAME, 'description': '专用于合成场景的测试实例'},
                 'targets': [] if args.shared_allowlist else ['group:20001'],
+                'dialogue': {'enabled': True, 'proactive': False},
                 'quiet_hours': [0, 0], 'ambient_debounce_seconds': 1,
                 'ambient_cooldown_seconds': 5}}}}}},
     }
+    if getattr(args,'enhanced_social',False):
+        settings = config['plugins']['entries']['hermes-social']['settings']['channels']['napcat']
+        settings['dialogue']['orchestration'] = True
+        settings['learning'] = dict(enabled=True,semantic=True,semantic_auto_trials=False)
     (home / 'config.yaml').write_text(hermes_yaml.safe_dump(config, allow_unicode=True))
     (home / '.env').write_text('')
     os.chmod(home / '.env', 0o600)
@@ -209,11 +229,11 @@ def load_plugin(plugin_root, module_name):
     return module, plugin_root
 
 
-def raw_message(text, mid, *, user=10001):
+def raw_message(text, mid, *, user=10001, name='合成群友'):
     return {
         'post_type': 'message', 'self_id': 90001, 'user_id': user,
         'message_id': mid, 'message_type': 'group', 'group_id': 20001,
-        'sender': {'user_id': user, 'card': '合成群友', 'nickname': '合成昵称'},
+        'sender': {'user_id': user, 'card': name, 'nickname': '合成昵称'},
         'message': [{'type': 'text', 'data': {'text': text}}],
     }
 
@@ -239,18 +259,39 @@ def plain_text(message):
                    if segment.get('type') == 'text')
 
 
-def instrument(stack, runner, adapter, state):
+def instrument(stack, runner, adapter, state, runtime):
     """Observe real methods; every wrapper calls its original exactly once."""
     from run_agent import AIAgent
     from gateway.session_ingress import executing_admission
     import gateway.session_envelope as envelope
     import agent.chat_completion_helpers as completion
+    from agent.plugin_llm import PluginLlm
 
     original_handle, original_run = runner._handle_message, runner._run_agent
     original_conversation = AIAgent.run_conversation
     original_restore = envelope.restore_native_source
     original_api = completion._build_api_kwargs_for_mode
     original_request = adapter._isolation_bridge.worker.request
+    original_facade = PluginLlm.acomplete
+    # Codex auxiliary clients resolve OAuth separately from GatewayRunner's
+    # runtime binding. Keep both real transports on the same read-only token.
+    stack.enter_context(patch('agent.auxiliary_client._resolve_codex_credential_and_base',
+                              return_value=(runtime['api_key'], runtime['base_url'])))
+
+    async def facade(self, messages, **kwargs):
+        if kwargs.get('purpose') != 'social_participation':
+            return await original_facade(self, messages=messages, **kwargs)
+        assert CANARY not in json.dumps(messages, ensure_ascii=False)
+        record = {'messages': copy.deepcopy(messages), 'completed': False}
+        state['selections'].append(record)
+        # The synthetic home intentionally has no auth store. Bind the same
+        # officially resolved, in-memory route used by the real gateway below;
+        # do not copy credentials or substitute a model response.
+        from agent.auxiliary_client import scoped_runtime_main
+        with scoped_runtime_main(runtime):
+            result = await original_facade(self, messages=messages, **kwargs)
+        record.update(completed=True, response=result.text, provider=result.provider, model=result.model)
+        return result
 
     async def handle(event):
         state['handlers'].append({'message_id': event.message_id, 'executing': bool(executing_admission.get()),
@@ -314,6 +355,7 @@ def instrument(stack, runner, adapter, state):
     stack.enter_context(patch.object(envelope, 'restore_native_source', restore))
     stack.enter_context(patch.object(completion, '_build_api_kwargs_for_mode', api))
     stack.enter_context(patch.object(adapter._isolation_bridge.worker, 'request', request))
+    stack.enter_context(patch.object(PluginLlm, 'acomplete', facade))
 
 
 async def verify(args, root, route, home, report):
@@ -338,7 +380,7 @@ async def verify(args, root, route, home, report):
     ctx = PluginContext(PluginManifest(name='hermes-napcat', kind='platform', source='user', path=str(plugin_root)), manager)
     social_ctx = PluginContext(PluginManifest(name='hermes-social', source='user', path=str(social_root)), manager)
     runner, adapter = None, None
-    state = {name: [] for name in ('handlers', 'turns', 'agents', 'restores', 'requests', 'worker_requests')}
+    state = {name: [] for name in ('handlers', 'turns', 'agents', 'restores', 'requests', 'worker_requests', 'selections')}
     report['trace'] = state
     with ExitStack() as stack:
         # Credential seam returns the official resolved route, not fake model
@@ -361,6 +403,8 @@ async def verify(args, root, route, home, report):
                           'guest_dm_users': []},
             'runtime': {'mode': 'social_agent', 'contract': 5, 'social_home': str(route['worker_home'])},
         })
+        if args.enhanced_social:
+            cfg.extra['local_conversation_context'] = True
         report['shared_group_allowlist'] = args.shared_allowlist
         # Provision a synthetic home channel, as in the reviewed deployment.
         # The first-contact nudge otherwise becomes a real outbound notice and
@@ -388,35 +432,96 @@ async def verify(args, root, route, home, report):
             adapter.gateway_runner = runner
             runner.adapters[Platform('napcat')] = adapter
             assert adapter.social_ready(), 'strict worker/gateway readiness failed'
-            instrument(stack, runner, adapter, state)
+            instrument(stack, runner, adapter, state, route['runtime'])
             runner._wire_adapter_handlers(adapter)
+            def historical(raw, *, request=False):
+                # These are explicitly authored past observations, not fresh
+                # transport acceptance. Every current case still enters _receive.
+                item = adapter.convert_event(raw,observe_only=True)
+                if args.enhanced_social:
+                    adapter._remember_public_observation(item)
+                adapter.participation.observe(item)
+                ledger = adapter.participation.life.enhanced.requests
+                if request and ledger is not None:
+                    ledger.assess(adapter.participation._scope('group:20001'),item,kind='new')
+                return item
             # A bounded public synthetic lead-in, through the real observer.
-            seed = adapter.convert_event(raw_message(
+            seed = historical(raw_message(
                 '合成活动甲：用两张色卡练习颜色配对。合成活动乙：用六张编号卡练习数字排序。以上规则仅用于测试。',
-                800), observe_only=True)
-            adapter.participation.observe(seed)
-            selected = CASES if args.case == 'all' else [case for case in CASES if case[0] == args.case]
+                800))
+            selected = ([case for case in CASES if args.enhanced_social or case[0] not in ENHANCED_ONLY]
+                        if args.case == 'all' else [case for case in CASES if case[0] == args.case])
+            if not args.enhanced_social and any(case[0] in ENHANCED_ONLY for case in selected):
+                raise ValueError('Request-state cases require --enhanced-social')
             for index, (name, text, should_speak) in enumerate(selected, 901):
+                if name == 'implicit_adoption':
+                    historical(raw_message('我们在筹备合成读书会，我负责选主题。',870,name='合成成员甲'),request=True)
+                    adapter.participation.record_self('group:20001','有哪个主题让大家想讨论？',
+                        '50870',reply_to_message_id='870')
+                    historical(raw_message(
+                        '我推荐先聊《纸舟纪事》，下一轮再谈《群星绘本》。',871,user=10002,name='合成成员乙'),
+                        request=False)
+                if name in {'source_attribution','independent_requests'}:
+                    mid = 850 if name == 'source_attribution' else 860
+                    question = ('合成寄件的目的地由大家提议，待我选定。' if name == 'source_attribution'
+                                else '合成寄件甲周一送达，目的地还没决定，请不要猜地址。')
+                    historical(raw_message(question,mid,name='合成成员甲'),request=True)
+                    adapter.participation.record_self('group:20001','这份合成寄件要送往哪座展厅？',
+                        str(50000+mid),reply_to_message_id=str(mid))
+                    contribution = ('我为这份共同寄件提议星桥展厅，请合成成员甲决定是否采用。'
+                        if name == 'source_attribution' else
+                        '我的独立寄件乙发到远帆馆，周三送达；乙件地址不作为甲件地址，请分别处理。')
+                    historical(raw_message(contribution,mid+1,user=10002,name='合成成员乙'),
+                               request=name=='independent_requests')
+                if name in {'collective_correction', 'collective_addressed'}:
+                    # Authored public observations and a synthetic verified ACK
+                    # form the old exchange; the new third member's correction
+                    # uses the real selector, native gateway and provider.
+                    root_id = 820 if name == 'collective_correction' else 830
+                    for seed_id, user, observation in (
+                        (root_id, 10002, '合成展览运输任务：共七箱，每车最多四箱；目的地与日期请其他群友补充。'),
+                        (root_id+1, 10003, '补充这份运输任务：送到星桥展厅，日期是周六。')):
+                        historical(raw_message(observation,seed_id,user=user),request=seed_id==root_id)
+                    dialogue = adapter.participation.life.dialogue
+                    scope = adapter.participation._scope('group:20001')
+                    for mid in (str(root_id), str(root_id+1)):
+                        dialogue.assess(scope, mid, topic_anchor=str(root_id), action='respond',
+                            reason='question' if mid == str(root_id) else 'followup',
+                            audience='group', selected=True)
+                    adapter.participation.record_self('group:20001',
+                        '合成旧安排：周六送往星桥展厅，七箱分两车，第一车四箱、第二车三箱。',
+                        str(50000+root_id), reply_to_message_id=str(root_id+1))
+                    historical(raw_message(
+                        '另一个独立话题：我的个人参观计划是远帆馆、十九箱，请不要并入展览运输。',
+                        root_id+2,user=10004))
                 if name == 'shared_context':
                     for seed_id, user, observation in (
                         (810, 77777, '合成计分规则R1：步骤丙增加三点，步骤丁增加五点。'),
                         (811, 88888, '规则R1仅用于合成测试，本轮按这份规则计算。')):
-                        adapter.participation.observe(adapter.convert_event(
-                            raw_message(observation, seed_id, user=user), observe_only=True))
-                if name == 'answer_to_question':
+                        historical(raw_message(observation,seed_id,user=user))
+                if name in {'answer_to_question','legacy_followup'}:
                     # The transport-send side of this pair is covered by the
                     # NapCat integration test. Seed only verified, synthetic
                     # observations; the new message still runs the whole
                     # worker/FIFO/source-codec/AIAgent gateway path below.
-                    prior = adapter.convert_event(raw_message('合成活动应该采用哪一份方案？', 700 + index),
-                                                  observe_only=True)
-                    adapter.participation.observe(prior)
+                    prior = historical(raw_message('合成活动应该采用哪一份方案？',700+index),
+                                       request=name=='answer_to_question')
                     adapter.participation.record_self('group:20001', '你选择选项甲还是选项乙？',
                                                       str(50000 + index),
                                                       reply_to_message_id=prior.message_id)
+                    for offset in range(14):
+                        historical(raw_message('另一个合成话题：材料正在按编号归类。',
+                                               30000+offset+(100 if name=='legacy_followup' else 0),user=10002))
                 before = {key: len(value) for key, value in state.items()}
                 send_before = len(sink.calls)
-                await adapter._receive(raw_message(text, index))
+                speaker_name = '合成成员甲' if name in {'source_attribution','independent_requests','implicit_adoption'} else '合成群友'
+                if name in ENHANCED_ONLY:
+                    earlier = ('合成算卡任务甲：每套四张，共三套，总共需要几张？' if name == 'combined_requests' else
+                               '合成寄件丙：每车最多六箱，箱数尚未确定。请先问清箱数，不要猜数量。')
+                    await adapter._receive(raw_message(earlier,40000+index,user=10002,name='合成前位成员'))
+                await adapter._receive(raw_message(text, index, name=speaker_name))
+                if name == 'earlier_share':
+                    await adapter._receive(raw_message('哈哈', 20000+index, user=10002))
                 await drain(adapter, authority)
                 agents, turns = state['agents'][before['agents']:], state['turns'][before['turns']:]
                 actions = sink.calls[send_before:]
@@ -425,9 +530,18 @@ async def verify(args, root, route, home, report):
                 actual_text = '\n'.join(plain_text(call['payload']['message']) for call in sends)
                 substantial = bool(isinstance(final, str) and not is_intentional_silence_response(final)
                                    and (len(re.findall(r'[\u4e00-\u9fff]', final)) >= 8
+                                        or name in {'answer_to_question','legacy_followup'} and '选项乙' in final
+                                        or name == 'turn_clock' and '明天' in final
                                         or name == 'identity' and TEST_SELF_NAME in final))
                 errors = []
+                selections = state['selections'][before['selections']:]
+                if name != 'emoji' and (not selections or not all(row['completed'] for row in selections)):
+                    errors.append('Public participation model selection missing or failed')
                 wire_requests = state['requests'][before['requests']:]
+                today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+                if wire_requests and not all('本轮可信当前日期（宿主时钟）：'+today.isoformat()
+                        in json.dumps(row['messages'], ensure_ascii=False) for row in wire_requests):
+                    errors.append('Trusted per-turn clock missing from actual model request')
                 worker_requests = state['worker_requests'][before['worker_requests']:]
                 early_gate = (not should_speak and not agents and not turns
                               and not wire_requests and not worker_requests)
@@ -447,7 +561,7 @@ async def verify(args, root, route, home, report):
                     errors.append('Real AIAgent completed on a different route or failed')
                 if not early_gate and (not turns or not all(t['executing'] and t['live_permit'] and t['ambient_valid']
                                         and t['actor'] == '10001' and t['chat_id'] == 'group:20001'
-                                        and t['reply_expected'] is False for t in turns)):
+                                        and t['reply_expected'] is (name == 'collective_addressed') for t in turns)):
                     errors.append('Exact-source ambient permit / FIFO / actor proof failed')
                 restored = state['restores'][before['restores']:]
                 if not early_gate and (not restored or not all(r['exact_live_source'] and r['permit_active'] for r in restored)):
@@ -471,9 +585,47 @@ async def verify(args, root, route, home, report):
                         or not re.search(r'步骤丙[^。；;\n]{0,16}[3三][^。；;\n]{0,4}点', final)
                         or not re.search(r'步骤丁[^。；;\n]{0,16}[5五][^。；;\n]{0,4}点', final)):
                     errors.append('Public rules from other members were not understood')
-                if name == 'answer_to_question' and (not isinstance(final, str) or '选项乙' not in final
+                if name in {'answer_to_question','legacy_followup'} and (not isinstance(final, str) or '选项乙' not in final
                                                      or '选项甲还是选项乙' in final):
                     errors.append('Proven short answer did not continue the bot question')
+                if name in {'collective_correction', 'collective_addressed'} and (not isinstance(final, str)
+                        or '星桥展厅' not in final or '周日' not in final
+                        or not re.search(r'[7七]\s*箱', final)
+                        or not re.search(r'[2两二]\s*(车|趟|批)', final)
+                        or '远帆馆' in final or '十九箱' in final):
+                    errors.append('Cross-member correction lost shared task conditions or mixed another topic')
+                tomorrow = today+timedelta(days=1)
+                expected_dates = (tomorrow.isoformat(), f'{tomorrow.year}年{tomorrow.month}月{tomorrow.day}日')
+                if name == 'turn_clock' and (not isinstance(final, str)
+                        or not any(date in re.sub(r'\s+', '', final) for date in expected_dates)):
+                    errors.append('Relative date did not use the fresh trusted turn clock')
+                if name == 'source_attribution' and (not isinstance(final,str)
+                        or not re.search(r'合成成员乙.{0,12}(提出|提议|提供)',final)
+                        or not re.search(r'(合成成员甲|你).{0,12}(采用|选定)',final)
+                        or re.search(r'合成成员甲.{0,6}(提出|提议|提供)',final)):
+                    errors.append('Shared condition changed its original contributor or current decision maker')
+                if name == 'independent_requests' and (not isinstance(final,str)
+                        or '远帆馆' in final or '周三' in final
+                        or not re.search(r'目的地|地址|展厅|哪里|哪',final)):
+                    errors.append('Independent member request inherited another member task conditions')
+                if name == 'implicit_adoption' and (not isinstance(final,str)
+                        or '纸舟纪事' not in final or '下周二' not in final
+                        or '群星绘本' in final or re.search(r'你.{0,6}(推荐|提议|提出|提供)',final)):
+                    errors.append('Implicit adoption lost the shared suggestion or changed its author')
+                request_states = {}
+                if args.enhanced_social:
+                    request_states = {item.request_id:item.state for item in adapter.participation.life.enhanced.request_context('group:20001')}
+                if name == 'combined_requests':
+                    if (not isinstance(final,str) or not re.search(r'甲[^。；;\n]{0,28}(12|十二)\s*张',final)
+                            or not re.search(r'乙[^。；;\n]{0,28}(10|十)\s*张',final)
+                            or request_states.get(str(index))!='responded'
+                            or request_states.get(str(40000+index))!='responded' or len(sends)!=1):
+                        errors.append('Combined independent requests did not both complete after the actual ACK')
+                if name == 'request_clarification':
+                    if (not isinstance(final,str) or not re.search(r'丁[^。；;\n]{0,28}(6|六)\s*张',final)
+                            or '箱' not in final or request_states.get(str(index))!='responded'
+                            or request_states.get(str(40000+index))!='waiting'):
+                        errors.append('Clarification was lost or incorrectly marked as completed')
                 if not should_speak and (sends or not early_gate and
                                          (not isinstance(final, str) or not is_intentional_silence_response(final))):
                     errors.append('Expected intentional silence and zero sends')
@@ -492,6 +644,8 @@ async def verify(args, root, route, home, report):
                         'model': agents[-1]['model'] if agents else None,
                         'provider': agents[-1]['provider'] if agents else None,
                         'early_gate': early_gate,
+                        'selection_calls': len(selections),
+                        'request_states':request_states,
                         'send_count': len(sends), 'captured_text': actual_text,
                         'tool_count': len(names), 'ledger': ledger, 'passed': not errors, 'errors': errors}
                 report['cases'].append(case)
