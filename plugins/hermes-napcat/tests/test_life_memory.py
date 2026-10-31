@@ -4,6 +4,7 @@ OneBot is captured and no model or real QQ connection is used. The gateway
 handoff is captured so prompt data and send-time revocation can be inspected.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 import os
@@ -77,9 +78,11 @@ class PersonIngress(unittest.IsolatedAsyncioTestCase):
         confirm = review.split('确认：')[1].split('\n')[0]
         return ident, confirm
 
-    async def gateway_input(self, text='公开名字，我喜欢什么？', *, user=77777, process=False):
+    async def gateway_input(self, text='公开名字，我喜欢什么？', *, user=77777, process=False, observe=False):
         inbound = self.adapter.convert_event(self.raw(text, user=user))
         self.assertIsNotNone(inbound)
+        if observe:
+            self.social.observe(inbound)
         route = self.adapter.settings.isolation.resolve(inbound.source)
         async def accepted(event):
             event._gateway_accepted = True
@@ -190,6 +193,60 @@ class PersonIngress(unittest.IsolatedAsyncioTestCase):
         with patch('plugins.plugin_storage.plugin_data_dir', side_effect=AssertionError('disabled storage')):
             self.assertIsNone(factories[0](None, self.adapter))
         for callback in callbacks: callback()
+
+    async def test_explicit_natural_group_memory_without_raw_collection(self):
+        self.adapter.uninstall_social_memory(self.service)
+        self.config['explicit_memory'] = {'enabled': True, 'ttl_days': 30}
+        self.config['agreements'] = {'enabled': True}
+        self.service = life.service.LifeMemoryService(self.home, self.home/'explicit-memory', self.config,
+            lambda: self.config, channel_domain=self.adapter.settings.isolation.domain_id,
+            channel_revision=self.adapter.settings.isolation.revision)
+        self.adapter.install_social_memory(self.service, registration_key=('hermes-life-memory', 'explicit-test'))
+        self.addCleanup(self.service.close)
+        reply = await self.command('请记住：我喜欢合成纸卡工坊')
+        ident = re.search(r'review ([a-f0-9]{32})', reply)[1]
+        review = await self.command('/social-memory review '+ident)
+        confirmation = review.split('确认：')[1].split('\n')[0]
+        self.assertIn('已确认', await self.command(confirmation))
+        inbound = await self.gateway_input('公开名字，请按本人资料给一句建议')
+        self.assertIn('合成纸卡工坊', inbound.test_person_prompt)
+        self.assertIn('evidence_and_validity', inbound.test_person_prompt)
+        self.assertEqual(self.social.context('group:20001'), [])
+        self.assertFalse(self.service.config['conversation']['enabled'])
+        with self.service.store.connection() as db:
+            self.assertEqual([row[0] for row in db.execute('SELECT user_text FROM sources')], ['合成纸卡工坊'])
+        original_call, counter = self.adapter.client.call, 99000
+        async def unique_ack(action, payload):
+            nonlocal counter
+            result = await original_call(action, payload)
+            if action == 'send_group_msg':
+                counter += 1
+                self.echo['message_id'] = counter
+                return {'message_id': counter}
+            return result
+        self.adapter.client.call = unique_ack
+        inbound = await self.gateway_input('公开名字，按已确认资料接续', process=True, observe=True)
+        delivered = await self.adapter.send('group:20001', '我按合成纸卡工坊来接续。', reply_to=inbound.message_id)
+        self.assertTrue(delivered.success)
+        await self.adapter.on_processing_complete(inbound, None)
+        self.assertIn('合成纸卡工坊', json.dumps(self.social.context('group:20001'), ensure_ascii=False))
+        self.assertIn('已忘记', await self.command('/social-memory forget '+ident))
+        self.assertNotIn('合成纸卡工坊', json.dumps(self.social.context('group:20001'), ensure_ascii=False))
+        due = (datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
+        response = await self.command('/social-memory plan '+due+' 核对合成纸卡清单')
+        plan_id = re.search(r'review ([a-f0-9]{32})', response)[1]
+        review = await self.command('/social-memory review '+plan_id)
+        self.assertIn('已确认', await self.command(review.split('确认：')[1].split('\n')[0]))
+        prompt = (await self.gateway_input('公开名字，下次约定是什么')).test_person_prompt
+        self.assertIn('核对合成纸卡清单', prompt)
+        self.assertIn('agreement', prompt)
+        response = await self.command('/social-memory episode 我们在合成工坊核对过纸卡编号')
+        experience_id = re.search(r'review ([a-f0-9]{32})', response)[1]
+        review = await self.command('/social-memory review '+experience_id)
+        self.assertIn('已确认', await self.command(review.split('确认：')[1].split('\n')[0]))
+        prompt = (await self.gateway_input('公开名字，上次经历是什么')).test_person_prompt
+        self.assertIn('我们在合成工坊核对过纸卡编号', prompt)
+        self.assertIn('subject_confirmed_statement', prompt)
 
     async def test_recall_and_plugin_unload_revoke_inflight_memory(self):
         ident, confirmation = await self.remember()

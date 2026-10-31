@@ -1,0 +1,14 @@
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1135,3 +1135,5 @@
++    public_shared_identity_contract = 1
++
+     def _combined_ephemeral_prompt(self) -> str:
+         """Platform context + YAML channel_prompts hint + channel_overrides system_prompt (or global
+         ephemeral) + the gateway ephemeral prompt."""
+@@ -1150,3 +1152,5 @@
+                 "这是公开 QQ 群会话。只使用本群已核验的输入和公开网络资料；"
++                "另可使用通道明确提供的共享SOUL人格与经私密侧筛选审核的非敏感日常记忆；"
++                "尊重保密托付，不披露、暗示或证实秘密，不把他人的经历当作当前成员的经历。"
+                 "不得读取或透露私人文件、私聊、密钥或其他群资料。"
+                 "私人请求请引导已验证主人在私聊重新提出。"

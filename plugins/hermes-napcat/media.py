@@ -23,7 +23,7 @@ KINDS = frozenset({'image', 'file', 'record'})
 
 
 class MediaPolicy:
-    def __init__(self, raw, *, groups, strict, require_mention, safe_trigger=None):
+    def __init__(self, raw, *, groups, strict, require_mention, safe_trigger=None, friend_dm=False):
         fields = {'enabled', 'groups', 'types', 'observe_metadata', 'references', 'download_hosts', 'download_policy',
                   'export_root', 'export_prefix', 'cloud', 'allow_derived_text', 'audio_fallback_model',
                   'budget_directory', 'daily_calls', 'daily_usd', 'reserve_usd', 'budget_mode'}
@@ -36,6 +36,7 @@ class MediaPolicy:
                 raise ValueError('media settings require explicit booleans')
             setattr(self, field, value)
         self.groups = raw.get('groups', [])
+        self.friend_dm = friend_dm is True
         self.types = raw.get('types', [])
         self.cloud = raw.get('cloud', [])
         self.hosts = raw.get('download_hosts', [])
@@ -51,7 +52,7 @@ class MediaPolicy:
         if self.audio_model is not None and self.audio_model not in AUDIO_MODELS:
             raise ValueError('fallback must explicitly support audio input')
         safe_trigger = require_mention is True if safe_trigger is None else safe_trigger
-        if self.enabled and (not strict or not safe_trigger or not self.groups or not self.types):
+        if self.enabled and (not strict or not safe_trigger or not (self.groups or self.friend_dm) or not self.types):
             raise ValueError('media requires strict isolation, bounded group trigger and explicit group/type allowlists')
         self.budget_mode = raw.get('budget_mode', 'local')
         if self.budget_mode not in {'local', 'provider'}:
@@ -312,7 +313,9 @@ class MediaService:
         return (account, route.domain_id, route.policy_revision, route.chat_id, route.user_id)
 
     def wants(self, raw, event):
-        return (event.source.chat_type == 'group' and event.source.chat_id[6:] in self.policy.groups
+        allowed = (event.source.chat_type == 'group' and event.source.chat_id[6:] in self.policy.groups
+                   or event.source.chat_type == 'dm' and self.policy.friend_dm)
+        return (allowed
                 and (any(s.get('type') in KINDS for s in raw.get('message', []) if isinstance(s, dict))
                      or bool(event.reply_to_message_id) or selection(event.text) is not None
                      or re.fullmatch(r'/media cancel -?[0-9]{1,20}', event.text.strip()) is not None))
@@ -337,11 +340,15 @@ class MediaService:
         def author_allowed(author):
             if not isinstance(author, str) or author == account:
                 return False
+            if route.chat_type == 'dm':
+                return author == route.user_id and group_policy is not None and group_policy.allows_guest_dm(author)
             if group_policy is not None:
                 return group_policy.allows_group_user(author, route.chat_id[6:])
             return author in allowed_users and re.fullmatch(r'[1-9][0-9]{0,19}', author) is not None
-        if (request.scope != scope or not self.policy.enabled or route.chat_type != 'group'
-                or route.chat_id[6:] not in self.policy.groups or not author_allowed(route.user_id)):
+        venue_allowed = (route.chat_type == 'group' and route.chat_id[6:] in self.policy.groups
+                         or route.chat_type == 'dm' and self.policy.friend_dm
+                         and route.chat_id == 'dm:'+route.user_id and route.domain_id != 'private')
+        if (request.scope != scope or not self.policy.enabled or not venue_allowed or not author_allowed(route.user_id)):
             raise MediaError('media_request_policy_changed')
         if request.error:
             raise MediaError(request.error)
@@ -359,14 +366,17 @@ class MediaService:
             # and a canonical authenticated author. No recursive reply/forward processing.
             author = str(result.get('user_id', ''))
             sender = result.get('sender', {})
-            has_group = 'message_type' in result and 'group_id' in result
-            if (('message_type' in result and result['message_type'] != 'group')
-                    or ('group_id' in result and str(result['group_id']) != route.chat_id[6:])
-                    or not has_group and not self.reference_sources.matches(account, route, request.reply_id, author)
+            has_venue = ('message_type' in result and (route.chat_type == 'dm' or 'group_id' in result))
+            wrong_venue = (result.get('message_type', 'group') != 'group'
+                           or 'group_id' in result and str(result['group_id']) != route.chat_id[6:]) if route.chat_type == 'group' else (
+                           result.get('message_type') != 'private' or author != route.user_id
+                           or 'group_id' in result or 'target_id' in result and str(result['target_id']) not in {account, route.user_id})
+            if (wrong_venue
+                    or not has_venue and not self.reference_sources.matches(account, route, request.reply_id, author)
                     or str(result.get('message_id', '')) != request.reply_id
                     or 'self_id' in result and str(result['self_id']) != account
                     or not author_allowed(author) or not isinstance(sender, dict)
-                    or group_policy is not None and group_policy.group_admission == 'all_members' and 'user_id' not in sender
+                    or route.chat_type == 'group' and group_policy is not None and group_policy.group_admission == 'all_members' and 'user_id' not in sender
                     or 'user_id' in sender and str(sender['user_id']) != author):
                 raise MediaError('reference_source_denied')
             refs += refs_from(result, request.reply_id, author)
@@ -397,7 +407,10 @@ class MediaService:
         location = ref.location
         if not location and ref.kind == 'file' and ref.handle:
             try:
-                result = await client.call('get_group_file_url', {'group_id': route.chat_id[6:], 'file_id': ref.handle})
+                if route.chat_type == 'dm':
+                    result = await client.call('get_private_file_url', {'file_id': ref.handle})
+                else:
+                    result = await client.call('get_group_file_url', {'group_id': route.chat_id[6:], 'file_id': ref.handle})
             except (OneBotError, asyncio.TimeoutError):
                 raise MediaError('handle_lookup_failed') from None
             if not isinstance(result, dict):

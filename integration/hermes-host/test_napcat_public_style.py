@@ -42,6 +42,19 @@ def test_legacy_adapter_keeps_group_privacy_without_private_prompt(turn_case):
     assert '不得读取或透露私人文件' in combined
 
 
+def test_shared_soul_contract_keeps_private_channel_overrides_out(turn_case):
+    from gateway.run_turn_runner import TurnRunner
+    if getattr(TurnRunner, 'public_shared_identity_contract', None) != 1:
+        pytest.skip('requires napcat-shared-identity.patch in an isolated host')
+    case = turn_case.prepare()
+    case.adapter.conversation_prompt_for_source = lambda source: 'SHARED_SOUL_AND_REVIEWED_DAILY_MEMORY'
+    combined = _combined(case)
+    assert 'SHARED_SOUL_AND_REVIEWED_DAILY_MEMORY' in combined
+    assert '经私密侧筛选审核' in combined
+    assert 'PRIVATE_CONTEXT_CANARY' not in combined
+    assert 'PRIVATE_CHANNEL_CANARY' not in combined
+
+
 def test_expired_public_style_does_not_fall_back_to_private_context(turn_case):
     case = turn_case.prepare()
     class ExpiredSource(ValueError):

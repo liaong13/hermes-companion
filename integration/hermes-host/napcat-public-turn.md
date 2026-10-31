@@ -9,7 +9,7 @@
 [napcat-public-turn.patch](napcat-public-turn.patch) 包含本模式依赖的完整宿主接线：
 
 - 以 adapter 的来源证明准入群消息，按群与真实成员隔离会话；群控制命令和敏感审批不进入群。
-- 不加载私人 SOUL、USER、MEMORY、prefill 或本地文件引用；群正文的 `@file:`、`@folder:` 和插件引用保持字面文本。
+- 默认不加载私人 SOUL、USER、MEMORY、prefill 或本地文件引用；群正文的 `@file:`、`@folder:` 和插件引用保持字面文本。显式启用[共享人格](../../plugins/hermes-napcat/docs/共享人格与日常记忆.md)时，只由可信通道提供同源 SOUL 与筛选审核后的非敏感日常摘要，仍不开放私人原文或文件读取工具。
 - 每次实际工具派发核验 turn authority；工具定义可见不代表拥有私人资料或主机权限。
 - 公共群 native validation 与快照恢复接续仍有效的原始 source。恢复必须完整匹配唯一的 live permit，并复核策略 revision、连接代数、撤回及插件寿命；不序列化可复用凭证，也不以 `_napcat_public_turn` 或队列状态代替授权。
 - permit 查找只在 ambient permit 精确属于当前 source 时优先使用它，否则查 source ledger，防止 A 回合的上下文干扰 B。

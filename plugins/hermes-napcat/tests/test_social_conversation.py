@@ -100,10 +100,12 @@ class PublicConversation(unittest.IsolatedAsyncioTestCase):
             result = await self.adapter.send('group:20001', '我有个不同的想法。', reply_to='37',
                                              metadata={'_interim_send': True})
             self.assertTrue(result.success)
+            self.assertEqual(self.social.states['group:20001'].generation, original)
+            self.assertEqual(self.social.context('group:20001'), [])
             result = await self.adapter.send('group:20001', '这次是真的接着聊天。', reply_to='37')
             self.assertTrue(result.success)
             self.assertEqual([row['text'] for row in self.social.context('group:20001')],
-                             ['我有个不同的想法。', '这次是真的接着聊天。'])
+                             ['这次是真的接着聊天。'])
         finally:
             await self.adapter.on_processing_complete(incoming, 'completed')
 

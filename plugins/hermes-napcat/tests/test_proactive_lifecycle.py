@@ -158,6 +158,8 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
     async def check_model_late_revocation(self, reason):
         inbound = await self.ambient_pair()
         authorize = await self.start_group(inbound)
+        calls_before = len(self.calls)
+        self.entered.clear()
         self.delay = True
 
         async def model_callback():
@@ -191,7 +193,7 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(late_denial)
             self.assertFalse(sent.success)
             self.assertFalse(self.sent)
-            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(len(self.calls), calls_before+1)
         finally:
             self.release.set()
             await self.adapter.on_processing_complete(inbound, None)
@@ -463,6 +465,20 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(optional_valid(self.adapter, inbound.source))
         release_optional(self.adapter, inbound.source)
         self.assertFalse(optional_valid(self.adapter, inbound.source))
+
+    async def test_forgotten_public_background_revokes_addressed_tool_authority(self):
+        background = self.parsed('公开名字，合成背景资料A', mid=108)
+        self.social.observe(background)
+        inbound = self.parsed('公开名字，请根据刚才资料查询公开信息', mid=109)
+        self.social.observe(inbound)
+        authorize = await self.start_group(inbound)
+        try:
+            self.assertTrue(self.social.forget_messages('group:20001', {'108'}))
+            self.assertIsNotNone(authorize('web_search', {'query': '已遗忘背景的迟到搜索'}))
+            with self.assertRaises(AdmissionDenied):
+                self.adapter.tool_authority_for_source(inbound.source)
+        finally:
+            await self.adapter.on_processing_complete(inbound, None)
 
     async def test_pause_context_recall_and_new_input_do_not_revoke_addressed_turn(self):
         for offset, reason in enumerate(('pause', 'context_recall', 'new_message')):

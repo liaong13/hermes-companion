@@ -6,6 +6,7 @@ OneBot、worker probe、解析字节与视觉响应均为显式 fixture，不访
 import asyncio
 import base64
 import copy
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -153,7 +154,11 @@ class AmbientMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.questions), 1)
         self.assertNotIn('本群此前的近期对话', self.questions[0])
         self.assertNotIn('本条是已允许自主参与', self.questions[0])
-        self.assertFalse(self.calls)  # no fallback to the plugin's LLM facade
+        # The public selector may run before media processing; media replies
+        # still use the original native path, never a plugin idle fallback.
+        for kwargs, *_ in self.calls:
+            self.assertEqual(json.loads(kwargs['messages'][-1]['content'])['kind'],
+                             'public_participation_selection')
 
     async def test_pure_image_uses_actual_media_pipeline_and_only_updates_recent_context(self):
         media = self.adapter.media

@@ -1,7 +1,7 @@
 name: hermes-napcat
 label: Hermes NapCat
 kind: platform
-version: 0.5.0
+version: 0.7.0
 description: Fail-closed OneBot 11 forward WebSocket adapter; no model tools.
 author: Hermes NapCat contributors
 license: MIT

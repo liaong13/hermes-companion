@@ -102,7 +102,7 @@ class IsolationBridge(ABC):
 
 class IsolationPolicy:
     def __init__(self, raw, *, owner_id, users, groups, require_mention, group_trigger=None,
-                 group_admission='allowed_users', self_id=None):
+                 group_admission='allowed_users', self_id=None, friend_dm=None):
         fields = {'mode', 'private_profile', 'social_profile', 'domain_id',
                   'policy_revision', 'guest_dm_users'}
         if not isinstance(raw, dict) or set(raw) - fields or raw.get('mode') != 'strict':
@@ -127,6 +127,12 @@ class IsolationPolicy:
         self.owner_id, self.users, self.groups = owner_id, users, groups
         self.guests = frozenset(guests)
         self.group_admission, self.self_id = group_admission, self_id
+        self.friend_dm = friend_dm
+
+    def allows_guest_dm(self, user):
+        if self.friend_dm is not None:
+            return self.friend_dm.allows(user)
+        return user in self.users and user in self.guests
 
     def allows_group_user(self, user, group):
         return (isinstance(user, str) and re.fullmatch(r'[1-9][0-9]{0,19}', user) is not None
@@ -145,10 +151,10 @@ class IsolationPolicy:
         mid = getattr(source, 'message_id', None)
         if not isinstance(mid, str) or not re.fullmatch(r'-?[0-9]{1,20}', mid):
             raise AdmissionDenied('invalid_message')
-        if kind == 'dm' and user in self.users and chat == 'dm:' + user:
-            if user == self.owner_id:
+        if kind == 'dm' and chat == 'dm:' + user:
+            if user == self.owner_id and user in self.users:
                 domain, profile = 'private', self.private_profile
-            elif user in self.guests:
+            elif self.allows_guest_dm(user):
                 domain, profile = self.domain_id, self.social_profile
             else:
                 raise AdmissionDenied('guest_dm_not_allowed')

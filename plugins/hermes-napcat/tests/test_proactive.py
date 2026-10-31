@@ -105,8 +105,14 @@ class SocialTests(unittest.IsolatedAsyncioTestCase):
             self.entered.set()
             if self.delay:
                 await self.release.wait()
+            result = self.response
+            if 'public_participation_selection' in kw['messages'][-1]['content']:
+                frame = json.loads(kw['messages'][-1]['content'])
+                result = {'selected': frame['candidates'][-1]['ref'], 'assessments': [
+                    dict(candidate=row['ref'], audience='group', action='respond',
+                         topic=row['ref'], reason='sharing') for row in frame['candidates']]}
             return ('offline', 'same-host-main', SimpleNamespace(choices=[SimpleNamespace(
-                    message=SimpleNamespace(content=json.dumps(self.response, ensure_ascii=False)))], usage=None))
+                    message=SimpleNamespace(content=json.dumps(result, ensure_ascii=False)))], usage=None))
         llm = PluginLlm(plugin_id='hermes-social', policy_loader=lambda p: _TrustPolicy(plugin_id=p), async_caller=provider)
         self.llm = llm
         self.binding = SimpleNamespace(home=self.home, active=True, validate=lambda: None,

@@ -1,6 +1,8 @@
 # Hermes Companion · NapCat 接入组件
 
-通过 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 将 QQ 好友私聊和群聊接入 [Hermes Agent](https://github.com/NousResearch/hermes-agent)。本组件属于 [Hermes Companion](../../README.md)，插件名为 `hermes-napcat`，平台配置名为 `napcat`，清单版本为 `0.5.0`。
+通过 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 将 QQ 好友私聊和群聊接入 [Hermes Agent](https://github.com/NousResearch/hermes-agent)。本组件属于 [Hermes Companion](../../README.md)，插件名为 `hermes-napcat`，平台配置名为 `napcat`，清单版本为 `0.7.0`。
+
+`0.7.0` 将群与普通好友正文接入实际回复覆盖检查，并支持按原会话隔离的跨天明确记忆。请求只有在真实送达 ACK 后才更新状态；详见[多人请求编排、跨天记忆与方法学习](../../docs/多人请求编排跨天记忆与方法学习.md)。
 
 **成套安装或升级优先使用 [INSTALL.md](../../INSTALL.md)**，由统一入口配齐插件、完整数据层、宿主增量、Skills、来源和配置。下面的暂存及手动配置保留给组件开发与选择性集成，不是完整安装命令。当前安装修复与验证范围见[验收记录](../../docs/安装修复与统一接入验收.md)。
 
@@ -10,7 +12,7 @@
 
 `0.3.3` 增加可选人物服务合同 1，供独立 [hermes-life-memory](../hermes-life-memory/README.md) 接入原始本人命令和公共群临时上下文。默认不附着服务、不启用长期记忆；需合同 5、已启用 social 与匹配存储源码，尚未真实 QQ 验收。
 
-Hermes Companion 是可组合的接入、隔离与记忆方案，不要求特定人格。`0.3.0` 将合同 5 的主动参与、状态与公开风格拆至独立 [hermes-social](../hermes-social/README.md)，本插件只提供可信来源、隔离接线与受限通道能力。历史合同 4 仍保留固定问答文案，修改唤醒词不改变该旧人格；可分发 Personas 尚未完成，公共路径不继承私人 SOUL。
+Hermes Companion 是可组合的接入、隔离与记忆方案，不要求特定人格。`0.3.0` 将合同 5 的主动参与、状态与公开风格拆至独立 [hermes-social](../hermes-social/README.md)，本插件只提供可信来源、隔离接线与受限通道能力。历史合同 4 仍保留固定问答文案，修改唤醒词不改变该旧人格；可分发 Personas 尚未完成。公共路径默认不继承私人 SOUL；合同 5 可显式启用[共享人格与日常记忆](docs/共享人格与日常记忆.md)，沿用当前 profile 的 `SOUL.md`，日常记忆先在私密侧筛选与独立审核。
 
 ## 能力与验收状态
 
@@ -123,7 +125,7 @@ runtime:
 
 `social_home` 仍只能含 `scoped-memory.json`，不得放模型配置或密钥。历史 `agent_home` 字段在合同 5 中不再用于模型运行；群聊沿用宿主已有模型和 web/image 工具配置。本模式必须配套 [napcat-public-turn.patch](../../integration/hermes-host/napcat-public-turn.patch)，不能只安装插件。实际测试部署已完成，并由用户确认重启后的群文本回复；这不等于 web 后端、图片回读和所有连续引用均已验证。
 
-精确 `dm:<主人ID>` 才能进入私人域；群内主人也走公共域。此 factory 不支持访客 DM，`guest_dm_users` 必须为空。Route 固定绑定域、profile、策略版本、来源和用户；名字、metadata 与自述不能改路由。准入、执行或回复失败不回落私人 handler。回复只能到本轮原目标、引用原消息；取消、断开、卸载与合同变更使迟到回复失效，没有重启后的持久后台回复能力。
+精确 `dm:<主人ID>` 才能进入私人域；群内主人也走公共域。`0.6.0` 增加独立的[受限好友私聊](docs/普通好友私聊.md)：通过 `friend_dm` 显式启用，当前好友资格必须由真实 `get_friend_list` 核验；普通好友使用无工具、无私人历史的宿主模型路径，不进入主人原生 agent。旧 `guest_dm_users` 作为显式名单兼容，标准工厂也须核验好友资格。Route 固定绑定域、profile、策略版本、来源和用户；名字、metadata 与自述不能改路由。准入、执行或回复失败不回落私人 handler。回复只能到本轮原目标、引用原消息；取消、断开、卸载与合同变更使迟到回复失效。
 
 旧 `ProcessIsolationBridge` 可由可信启动代码另行注入，`admit` 须在 5 秒内返回绑定同一 Route 的 Admission；这不是普通工厂已启用长期记忆的证据。完整运行材料、宿主 API、工厂与 worker 差异见 [测试部署接线](docs/测试部署接线.md)及[接入与隔离设计](docs/接入与隔离设计.md)。
 
@@ -131,7 +133,7 @@ runtime:
 
 安装并显式启用 `hermes-social` 后，未点名自然接话共用本插件的 `allowed_groups`，仍走真实合同 5 和既有工具／资料授权；不全局关闭 `require_mention`。空闲文本仅发往社交插件明确配置的目标，不自动跟随群白名单扩大。没有／卸载社交插件时，正常点名和主人私聊仍保留。
 
-新策略命名空间为 `plugins.entries.hermes-social.settings.channels.napcat`；旧 `platforms.napcat.extra.proactive` 不再由连接器解释。迁移、状态采用与回退见[主动聊天迁移](docs/主动聊天.md)及[社交插件说明](../hermes-social/README.md)。仍需兼容宿主安静交付／公开风格钩子与 worker；源码、安装、活动网关与 QQ 验收分别报告。加好友、普通群友私聊及多人长期记忆不在本次范围。
+新策略命名空间为 `plugins.entries.hermes-social.settings.channels.napcat`；旧 `platforms.napcat.extra.proactive` 不再由连接器解释。迁移、状态采用与回退见[主动聊天迁移](docs/主动聊天.md)及[社交插件说明](../hermes-social/README.md)。仍需兼容宿主安静交付／公开风格钩子与 worker；源码、安装、活动网关与 QQ 验收分别报告。自动加好友及多人长期记忆仍不属于通道能力；普通好友私聊需要独立准入和好友核验。
 
 ### 可选媒体与费用
 

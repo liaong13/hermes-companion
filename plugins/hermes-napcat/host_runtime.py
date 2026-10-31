@@ -28,8 +28,10 @@ from .runtime_bridge import SandboxedWorker
 from .media_io import MediaError, MediaFetcher
 from .media import MediaRequest
 from .process_owner import ProcessCleanupError
-from .participation import OptionalSources, ParticipationPort
+from .participation import OptionalSources, ParticipationPort, PublicObservations
 from .social_memory import SocialMemoryMixin
+from .friend_dm import FriendDmMixin
+from .shared_identity import SharedIdentity
 from gateway.platforms.base import SendResult
 
 logger = logging.getLogger(__name__)
@@ -189,6 +191,7 @@ class HostBinding:
         self.active = False
         for adapter in self._adapters:
             adapter._optional_sources.invalidate()
+            adapter._friend_dm_reset()
 
     def validate(self):
         from hermes_constants import get_hermes_home
@@ -333,11 +336,12 @@ class HostIsolationBridge(IsolationBridge):
         await reply(text)
 
 
-class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
+class HostedNapCatAdapter(FriendDmMixin, SocialMemoryMixin, NapCatAdapter):
     """Exact owner DM native lifecycle, social messages exclusively via bridge."""
     def __init__(self, config, binding, bridge):
         super().__init__(config, isolation_bridge=bridge)
         self.binding = binding
+        self.shared_identity = SharedIdentity(binding, self.settings.shared_identity)
         self._native_permit = ContextVar('napcat_native_permit', default=None)
         self._group_permit = ContextVar('napcat_group_permit', default=None)
         self._group_permits = {}
@@ -347,7 +351,9 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         self._native_admitted, self._native_permits = OrderedDict(), {}
         self._native_open = True
         self._optional_sources = OptionalSources(self)
+        self._public_observations = PublicObservations(self)
         self._optional_media = OrderedDict()
+        self._init_friend_dm()
         if isinstance(binding, HostBinding):
             binding._adapters.add(self)
         if bridge.gateway_tools:
@@ -377,6 +383,7 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
 
     def uninstall_participation(self, port):
         # Late cleanup from an old plugin cannot detach its replacement.
+        self._public_observations.revoke_port(port)
         if getattr(self.participation, 'port', None) is not port:
             self._optional_sources.revoke_port(port)
             return
@@ -385,6 +392,11 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         self.participation = NullParticipation()
         if self._plugin_handlers_wired is not None and port._registration_key is not None:
             self._plugin_handlers_wired.discard(port._registration_key)
+
+    def _remember_public_observation(self, event):
+        """Called only by admitted receive/bridge code, never port observers."""
+        port = getattr(self.participation, 'port', None)
+        return bool(port is not None and self._public_observations.remember(port, event))
 
     def _release_optional_media(self, proof):
         if self._optional_media.get(id(proof.event)) is proof:
@@ -626,6 +638,10 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
             raise AdmissionDenied('group_gateway_ingress_capacity')
         proof = (event, event.source, route, self._connection_epoch, now + 300)
         self._group_ingress[id(event.source)] = proof
+        # The bridge has admitted this exact native/media wrapper. Join only
+        # an already observed root; worker latency never renews its data TTL.
+        if (route.chat_id, route.message_id) in self._public_observations.roots:
+            self._remember_public_observation(event)
         event.source._napcat_public_turn = True
         event._napcat_group_route = route
         event._napcat_connection_epoch = self._connection_epoch
@@ -689,7 +705,9 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
             raise AdmissionDenied('group_tool_principal_unavailable')
         permit = self._group_permit_for_source(source)
         if (permit is None or not permit.active or permit.connection_epoch != self._connection_epoch
+                or not self._shared_identity_current(permit)
                 or getattr(permit, 'person_context_current', None) is not None and not permit.person_context_current()
+                or getattr(permit, 'public_context_view', None) is not None and not permit.public_context_view.current()
                 or permit.route.chat_id != source.chat_id or permit.route.user_id != source.user_id
                 or permit.route.message_id != source.message_id
                 or self.settings.isolation.revision != permit.route.policy_revision
@@ -714,7 +732,9 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
             # HERMES_HOME, is the authority at this boundary.
             self.binding.validate_active()
             if (not permit.active or permit.connection_epoch != self._connection_epoch
+                    or not self._shared_identity_current(permit)
                     or getattr(permit, 'person_context_current', None) is not None and not permit.person_context_current()
+                    or getattr(permit, 'public_context_view', None) is not None and not permit.public_context_view.current()
                     or not self._native_open or self.settings.isolation.revision != route.policy_revision
                     or source.chat_id != route.chat_id or source.user_id != route.user_id
                     or source.message_id != route.message_id
@@ -765,6 +785,7 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         # task's permit by then; never admit a different source in that task.
         permit = self._group_permit_for_source(source)
         if (permit is None or not permit.active or getattr(permit, 'source', None) is not source
+                or not self._shared_identity_current(permit)
                 or getattr(permit, 'person_context_current', None) is not None and not permit.person_context_current()
                 or permit.connection_epoch != self._connection_epoch or not self._native_open
                 or self._media_recalled(permit.route.chat_id, permit.route.message_id)
@@ -798,6 +819,30 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         return route
 
     async def _receive(self, raw):
+        self._friend_dm_recall(raw)
+        if (self.settings.friend_dm.enabled and self._friend_dm_candidate(raw)
+                and self._cleanup_error is None and self.binding.active and self._native_open):
+            if not await self._verify_friend_dm(str(raw.get('user_id'))):
+                self.admission_counts['denied'] += 1
+                return
+            event = self.convert_event(raw)
+            if event is None:
+                return
+            from .adapter import label
+            name = label((raw.get('sender') or {}).get('nickname')) or self._friend_nicknames.get(event.user_id) or '好友'
+            event.user_name = event.source.user_name = name
+            event.channel_context = ''
+            self._optional_sources.observe(event)
+            memory_control = self._friend_memory_control(event, raw)
+            if not memory_control:
+                self._remember_public_observation(event)
+                self.participation.observe(event)
+            control = None if memory_control else self.participation.control(event)
+            if control is not None:
+                event._friend_control_result = control
+            self.admission_counts['social'] += 1
+            self._queue_friend_dm(event, raw)
+            return
         if (isinstance(raw, dict) and raw.get('post_type') == 'notice'
                 and raw.get('notice_type') == 'friend_recall'
                 and str(raw.get('self_id', '')) == self.settings.self_id
@@ -885,12 +930,14 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
                     and isinstance(segment.get('data'), dict)
                     for segment in raw.get('message', ()))
                 self._optional_sources.observe(candidate)
+                self._remember_public_observation(candidate)
                 self.participation.observe(candidate)
                 self._register_reference_source(raw)
                 control = self.participation.control(candidate)
                 if control is not None:
                     event = self.convert_event(raw)
                     if event is not None:
+                        self._remember_public_observation(event)
                         event.text += '\n本地已核验控制结果：' + control
                         event.reply_expected = True
                         event.allow_gateway_control = False
@@ -905,6 +952,7 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
                     else:
                         event = self.convert_event(raw)
                         if event is not None:
+                            self._remember_public_observation(event)
                             # Consume/freeze before observation's first await; a
                             # later image cannot replace this request or pending turn.
                             route = self.settings.isolation.resolve(event.source)
@@ -929,20 +977,53 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
 
     async def on_processing_start(self, event):
         if getattr(event.source, '_napcat_public_turn', False):
+            if self.settings.shared_identity.enabled and not (
+                    self._local_context_host_ready() and self._shared_identity_host_ready()):
+                raise AdmissionDenied('shared_identity_host_contract_unavailable')
             route = self._group_ingress_route(event.source, event)
             if route is None or route != getattr(event, '_napcat_group_route', None):
                 raise AdmissionDenied('group_gateway_source_denied')
+            # Explicit addressing still needs the group's shared topic, including
+            # exact-reference recovery after a restart. Its right to receive a
+            # normal reply does not depend on an optional-participation verdict.
+            direct = getattr(self.participation, 'prepare_direct_dialogue', None)
+            dialogue = getattr(getattr(self.participation, 'policy', None), 'dialogue', {})
+            if event.reply_expected and dialogue.get('enabled') and callable(direct):
+                try:
+                    await direct(event)
+                except Exception as exc:
+                    logger.warning('Group topic context unavailable (%s); addressed turn continues',
+                                   type(exc).__name__)
+                if self._group_ingress_route(event.source, event) != route:
+                    raise AdmissionDenied('group_gateway_source_denied')
             self._group_ingress.pop(id(event.source), None)
             permit = _ReplyPermit(route)
             permit.allowed_images = set()
             permit.source = event.source
+            permit.event = event
             permit.connection_epoch = self._connection_epoch
             (permit.person_context_current, permit.person_context_text,
              permit.person_context_view, permit.person_memory_service) = self._take_person_context(event.source)
             prepare = getattr(self.participation,'prepare_public_context',None)
-            permit.public_context_view = prepare(event) if callable(prepare) else None
             self._group_permits[id(permit)] = permit
             self._group_permit.set(permit)
+            permit.shared_identity_pending = self.settings.shared_identity.enabled
+            try:
+                def current():
+                    return (permit.active and self._native_open
+                        and self._group_permits.get(id(permit)) is permit
+                        and permit.connection_epoch == self._connection_epoch
+                        and self.settings.isolation.resolve(event.source) == route
+                        and not self._media_recalled(route.chat_id, route.message_id)
+                        and self._optional_sources.valid(event.source))
+                permit.shared_identity_view = await self.shared_identity.prepare(current)
+                permit.shared_identity_pending = False
+                permit.public_context_view = prepare(event) if callable(prepare) else None
+            except BaseException:
+                permit.active = False
+                self._group_permits.pop(id(permit), None)
+                self._group_permit.set(None)
+                raise
             self._participation_processing_start(event)
             return
         route = self._native_route(event)
@@ -977,7 +1058,7 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         self.participation.processing_start(event)
 
     def conversation_prompt_for_source(self, source):
-        """Public style for opted-in chats, never the owner's private persona.
+        """Exact-source style, optional shared SOUL and reviewed daily memory.
 
         The default style is static. Optional person facts are a bounded,
         current-turn-only data block, never persisted as inbound user text.
@@ -986,8 +1067,12 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         person_context = self._person_prompt_for_source(source)
         permit = self._group_permit_for_source(source) if source.chat_type=='group' else None
         public_view = getattr(permit,'public_context_view',None)
+        identity = getattr(permit, 'shared_identity_view', None)
+        if identity is not None and not self.admit_group_source(source):
+            raise AdmissionDenied('shared_identity_source_expired')
+        identity_text = identity.text if identity is not None else ''
         if not self.participation.enabled_for(source.chat_id):
-            return person_context
+            return '\n\n'.join(part for part in (identity_text, person_context) if part)
         self.binding.validate_active()
         if source.chat_type == 'group':
             if not self.admit_group_source(source):
@@ -997,8 +1082,15 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
             permit = self._native_permit.get()
             if permit is None or permit.route != self.settings.isolation.resolve(source):
                 raise AdmissionDenied('conversation_source_expired')
-        return '\n\n'.join(part for part in (self.participation.prompt_for_chat(source.chat_id),
+        return '\n\n'.join(part for part in (identity_text, self.participation.prompt_for_chat(source.chat_id),
             public_view.text if public_view is not None else '',person_context) if part)
+
+    @staticmethod
+    def _shared_identity_current(permit):
+        if getattr(permit, 'shared_identity_pending', False):
+            return False
+        view = getattr(permit, 'shared_identity_view', None)
+        return view is None or view.current()
 
     def social_ready(self):
         return (self.binding.active and self._native_open and not self._closing
@@ -1006,6 +1098,17 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
                 and getattr(self._isolation_bridge, 'gateway_tools', False) and self._public_group_ready())
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if (metadata or {}).get('_interim_send'):
+            metadata = {**metadata, 'non_conversational': True}
+        if not (metadata or {}).get('non_conversational'):
+            content = self._shape_public_reply(chat_id, content)
+            source = self._current_group_delivery_source(chat_id)
+            permit = self._group_permit.get()
+            prepare = getattr(self.participation, 'prepare_reply', None)
+            event = getattr(permit, 'event', None)
+            if (source is not None and event is not None and event.source is source
+                    and callable(prepare) and not (metadata or {}).get('expect_edits')):
+                await prepare(event, content)
         result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
         if not result.success:
             code = (result.raw_response or {}).get('error_code','transport_unknown')
@@ -1017,9 +1120,37 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
             response = result.raw_response if isinstance(result.raw_response, dict) else {}
             ids = response.get('message_ids')
             first_id = ids[0] if isinstance(ids, list) and ids else result.message_id
-            self._optional_sources.advance(chat_id)
-            self.participation.record_self(chat_id, content, first_id, reply_to_message_id=reply_to)
+            source = self._current_group_delivery_source(chat_id)
+            self._optional_sources.advance(chat_id, preserve_source=source)
+            kwargs = {'source': source} if source is not None else {}
+            self.participation.record_self(chat_id, content, first_id, reply_to_message_id=reply_to, **kwargs)
         return result
+
+    def _current_group_delivery_source(self, chat):
+        permit = self._group_permit.get()
+        source = getattr(permit, 'source', None)
+        if (permit is not None and self._group_permits.get(id(permit)) is permit
+                and source is not None and permit.route.chat_id == chat
+                and self.admit_group_source(source)):
+            return source
+        return None
+
+    def _shape_public_reply(self, chat, content):
+        if not (chat.startswith('group:') or self.public_dm_allowed(chat)) or not isinstance(content, str):
+            return content
+        reader = getattr(self.participation, 'reply_char_limit', None)
+        limit = reader(chat) if callable(reader) else None
+        if limit is None:
+            return content
+        if type(limit) is not int or not 32 <= limit <= 3000:
+            raise AdmissionDenied('invalid_public_reply_limit')
+        if len(content) <= limit:
+            return content
+        prefix = content[:limit-1]
+        ending = max(prefix.rfind(mark) for mark in '。！？\n')
+        if ending >= limit//2:
+            return prefix[:ending+1]
+        return prefix.rstrip()+'…'
 
     async def _send_initiative_text(self, grant, text, port):
         """Final transport boundary: consume an exact single-use capability."""
@@ -1062,9 +1193,13 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
             if (not isinstance(echoed, dict) or str(echoed.get('message_id')) != mid
                     or echoed.get('message_type') != kind or str(echoed.get('user_id')) != self.settings.self_id
                     or kind == 'group' and str(echoed.get('group_id')) != chat.partition(':')[2]
-                    or kind == 'private' and str(echoed.get('target_id', '')) != chat.partition(':')[2]
+                    or kind == 'private' and 'target_id' in echoed
+                    and str(echoed['target_id']) != chat.partition(':')[2]
                     or echoed_text != text or echoed_at != ([contact.recipient] if contact else [])):
                 raise AdmissionDenied('social_initiative_readback_unverified')
+            if kind == 'private' and self._native_open and grant.epoch == self._connection_epoch:
+                if not self._remember_private_receipt(chat, mid, text):
+                    raise AdmissionDenied('social_initiative_receipt_reused')
             recordable = True
             if contact is not None:
                 try:
@@ -1096,6 +1231,7 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
         if group_permit is not None:
             route = group_permit.route
             if (not group_permit.active or group_permit.connection_epoch != self._connection_epoch
+                    or not self._shared_identity_current(group_permit)
                     or getattr(group_permit, 'person_context_current', None) is not None
                     and not group_permit.person_context_current()
                     or getattr(group_permit,'public_context_view',None) is not None
@@ -1157,6 +1293,12 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
                     or not any(isinstance(segment, dict) and segment.get('type') == 'image'
                                for segment in echoed['message'])):
                 raise AdmissionDenied('group_image_readback_unverified')
+            source = self._current_group_delivery_source(chat_id)
+            port = getattr(self.participation, 'port', None)
+            if isinstance(port, ParticipationPort):
+                port.invalidate_optional(chat_id, preserve_source=source)
+            else:
+                self._optional_sources.advance(chat_id, preserve_source=source)
             return SendResult(success=True, message_id=sent_id)
         except Exception:
             return SendResult(success=False, error='NapCat group image delivery denied or failed')
@@ -1194,7 +1336,9 @@ class HostedNapCatAdapter(SocialMemoryMixin, NapCatAdapter):
 
     def _connection_lost(self):
         super()._connection_lost()
+        self._friend_dm_reset()
         self._optional_sources.invalidate()
+        self._public_observations.clear()
         self._connection_epoch += 1
         self._person_contexts.clear()
         self._group_ingress.clear()
@@ -1214,7 +1358,7 @@ def create_adapter(config, binding):
                                                       {'mode', 'social_home', 'agent_home', 'contract'})
             or (raw['mode'], raw['contract']) not in (('host_llm', 4), ('social_agent', 5))
             or (raw['mode'] == 'host_llm' and 'agent_home' in raw)
-            or settings.isolation is None or settings.isolation.guests or not settings.groups):
+            or settings.isolation is None or not settings.groups):
         raise ValueError('explicit group runtime contract required')
     home = Path(raw['social_home'])
     validate_social_home(home, binding)

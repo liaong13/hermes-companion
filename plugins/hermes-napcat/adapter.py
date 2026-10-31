@@ -23,6 +23,8 @@ from .media import MediaPolicy, MediaService, MediaRef, refs_from, safe_value
 from .media_io import MediaError
 from .process_owner import ProcessCleanupError
 from .participation import NullParticipation
+from .friend_dm import FriendDmPolicy
+from .shared_identity import SharedIdentityPolicy
 
 
 @dataclass
@@ -129,7 +131,13 @@ class Settings:
             raise ValueError('require_mention and typing must be YAML booleans')
         self.group_trigger = GroupTrigger(extra.get('group_trigger'), self.require_mention)
         self.group_admission = extra.get('group_admission', 'allowed_users')
+        modern_dm = isinstance(extra.get('runtime'), dict) and extra['runtime'].get('contract') in {4, 5}
+        isolation_raw = extra.get('isolation')
+        guests = isolation_raw.get('guest_dm_users', []) if modern_dm and isinstance(isolation_raw, dict) else []
+        self.friend_dm = FriendDmPolicy(extra.get('friend_dm'), owner_id=self.owner_id,
+            self_id=self.self_id, guests=guests, groups=self.groups)
         self.local_conversation_context = extra.get('local_conversation_context', False)
+        self.shared_identity = SharedIdentityPolicy(extra.get('shared_identity'))
         if type(self.local_conversation_context) is not bool:
             raise ValueError('local_conversation_context must be a boolean')
         if self.group_admission not in ('allowed_users', 'all_members'):
@@ -139,13 +147,21 @@ class Settings:
         self.isolation = (IsolationPolicy(extra['isolation'], owner_id=self.owner_id,
                          users=self.users, groups=self.groups,
                          require_mention=self.require_mention, group_trigger=self.group_trigger,
-                         group_admission=self.group_admission, self_id=self.self_id) if 'isolation' in extra else None)
+                         group_admission=self.group_admission, self_id=self.self_id,
+                         friend_dm=self.friend_dm if modern_dm else None) if 'isolation' in extra else None)
+        if self.friend_dm.enabled and (self.isolation is None or not isinstance(extra.get('runtime'), dict)
+                or extra['runtime'].get('contract') not in {4, 5}):
+            raise ValueError('friend_dm requires strict host runtime')
         if self.local_conversation_context and (self.isolation is None
                 or not isinstance(extra.get('runtime'), dict) or extra['runtime'].get('contract') != 5):
             raise ValueError('local conversation context requires strict gateway contract 5')
+        if self.shared_identity.enabled and (self.isolation is None
+                or not isinstance(extra.get('runtime'), dict) or extra['runtime'].get('contract') != 5):
+            raise ValueError('shared identity requires strict gateway contract 5')
         self.media = MediaPolicy(extra.get('media', {}), groups=self.groups,
                                  strict=self.isolation is not None, require_mention=self.require_mention,
-                                 safe_trigger=self.group_trigger.strict_safe)
+                                 safe_trigger=self.group_trigger.strict_safe,
+                                 friend_dm=self.friend_dm.enabled and self.friend_dm.media)
         self.url = extra.get('ws_url', 'ws://127.0.0.1:13011')
         parsed = urlsplit(self.url)
         if (parsed.scheme != 'ws' or parsed.hostname not in ('127.0.0.1', '::1')
@@ -171,6 +187,8 @@ class NapCatAdapter(BasePlatformAdapter):
         self._seen = OrderedDict()
         self._friends = {}
         self._friends_refresh_at = 0.0
+        self._friends_lock = asyncio.Lock()
+        self._friend_nicknames = {}
         if isolation_bridge is not None and not isinstance(isolation_bridge, IsolationBridge):
             raise TypeError('isolation_bridge must implement the host bridge contract')
         if isolation_bridge is not None and self.settings.isolation is None:
@@ -280,7 +298,7 @@ class NapCatAdapter(BasePlatformAdapter):
                 return None
             chat_type, chat = 'group', 'group:' + target
         elif kind == 'private' and raw.get('sub_type', 'friend') == 'friend':
-            if user not in s.users:
+            if user not in s.users and not (s.isolation and s.isolation.allows_guest_dm(user)):
                 return None
             chat_type, chat = 'dm', 'dm:' + user
         else:
@@ -331,7 +349,8 @@ class NapCatAdapter(BasePlatformAdapter):
             else:
                 # Deliberately exclude URLs, paths and file references from media metadata.
                 safe_type = t if t in {'image', 'record', 'video', 'file', 'face', 'forward', 'json', 'xml'} else 'segment'
-                supported = (self.media is not None and chat_type == 'group' and target in s.media.groups
+                supported = (self.media is not None and (chat_type == 'group' and target in s.media.groups
+                             or chat_type == 'dm' and s.media.friend_dm and s.friend_dm.allows(user))
                              and t in s.media.types)
                 prefix = '[attachment:' if supported else '[unsupported:'
                 parts.append(prefix + safe_type + ']')
@@ -374,9 +393,13 @@ class NapCatAdapter(BasePlatformAdapter):
             and all(isinstance(segment, dict) and segment.get('type') in {'text', 'at'} for segment in segments))
         return event
 
-    async def _refresh_friends(self):
+    async def _refresh_friends(self, *, force=False):
+        async with self._friends_lock:
+            await self._refresh_friends_locked(force=force)
+
+    async def _refresh_friends_locked(self, *, force=False):
         now = time.monotonic()
-        if not self.client or now < self._friends_refresh_at:
+        if not self.client or not force and now < self._friends_refresh_at:
             return
         # Throttle failures too; identity lookup must never block message delivery.
         self._friends_refresh_at = now + 60
@@ -384,19 +407,26 @@ class NapCatAdapter(BasePlatformAdapter):
             async with asyncio.timeout(2):
                 rows = await self.client.call('get_friend_list', {'no_cache': True})
             if not isinstance(rows, list):
-                return
+                raise ValueError('invalid authenticated friend list')
             friends = {}
+            nicknames = {}
             for row in rows:
                 if not isinstance(row, dict):
                     continue
                 user = str(row.get('user_id', ''))
+                if re.fullmatch(r'[1-9][0-9]{0,19}', user):
+                    nicknames[user] = label(row.get('nickname'))
                 if user in self.settings.users:
                     friends[user] = {k: label(row.get(k)) for k in ('nickname', 'remark')}
             self._friends = friends
+            self._friend_nicknames = nicknames
+            self.settings.friend_dm.update(nicknames)
             self._friends_refresh_at = now + 300
         except Exception:
             # Do not retain stale remarks after a failed refresh.
             self._friends = {}
+            self._friend_nicknames = {}
+            self.settings.friend_dm.update((), ttl=0)
 
     async def _verified_self_reply(self, raw):
         """Return bounded visible text only after same-group bot provenance is proven."""
@@ -958,7 +988,8 @@ class NapCatAdapter(BasePlatformAdapter):
         kind, separator, number = str(chat_id).partition(':')
         number = qq_id(number)
         allowed = self.settings.users if kind == 'dm' else self.settings.groups if kind == 'group' else ()
-        if not separator or number not in allowed:
+        friend = kind == 'dm' and self.settings.friend_dm.allows(number)
+        if not separator or number not in allowed and not friend:
             raise ValueError('target denied: use explicitly allowed dm:<id> or group:<id>')
         return ('send_private_msg', {'user_id': int(number)}) if kind == 'dm' else ('send_group_msg', {'group_id': int(number)})
 

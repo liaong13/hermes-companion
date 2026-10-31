@@ -30,7 +30,7 @@ class NullParticipation:
     def recognizes_control(self, chat, text): return False
     def observe(self, event): pass
     def record_image_context(self, chat, mid, text): return False
-    def record_self(self, chat, text, mid, *, reply_to_message_id=None): pass
+    def record_self(self, chat, text, mid, *, reply_to_message_id=None, source=None): pass
     def recall(self, chat, mid): pass
     def forget_messages(self, chat, message_ids): return False
     def contact_control_feedback(self, chat, actor, message_id, feedback): pass
@@ -42,6 +42,129 @@ class NullParticipation:
     def start(self): pass
     async def stop(self): pass
     def reset_connection(self): pass
+
+
+@dataclass(frozen=True)
+class _ObservationRoot:
+    route: object
+    port: object
+    epoch: int
+    deadline: float
+    friend_revision: object
+
+
+@dataclass(frozen=True)
+class _PublicObservation:
+    event: object
+    source: object
+    root: _ObservationRoot
+
+
+class PublicObservations:
+    """Bounded RAM evidence of received data, never a reply/tool permit.
+
+    Only the adapter's admitted receive path calls remember(). Exact native
+    wrappers may join an existing message root without extending its lifetime.
+    Activity revisions intentionally do not invalidate another member's data.
+    """
+    def __init__(self, adapter):
+        self._receiver = weakref.ref(adapter)
+        self.roots = OrderedDict()
+        self.events = OrderedDict()
+
+    @staticmethod
+    def _key(route):
+        return route.chat_id, route.message_id
+
+    def _prune(self, now):
+        for key, proof in tuple(self.events.items()):
+            if proof.root.deadline <= now or self.roots.get(self._key(proof.root.route)) is not proof.root:
+                self.events.pop(key, None)
+
+    @staticmethod
+    def _route(adapter, port, event):
+        try:
+            if not port.ready():
+                return None
+            adapter.binding.validate()
+            source = event.source
+            route = adapter.settings.isolation.resolve(source)
+            if (route.domain_id == 'private' or event.user_id != route.user_id
+                    or event.message_id != route.message_id):
+                return None
+            if not port._controller.observes(route.chat_id):
+                return None
+            if route.chat_type == 'group' and route.chat_id[6:] not in adapter.settings.groups:
+                return None
+            if route.chat_type != 'group' and (route.chat_type != 'dm' or not adapter.public_dm_allowed(route.chat_id)):
+                return None
+            if adapter._media_recalled(route.chat_id, route.message_id):
+                return None
+            return route
+        except (AdmissionDenied, AttributeError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _friend_revision(adapter, route):
+        if route.chat_type != 'dm':
+            return None
+        policy = adapter.settings.friend_dm
+        return policy.revision, policy.membership_revision(route.user_id)
+
+    def remember(self, port, event):
+        adapter, now = self._receiver(), time.monotonic()
+        self._prune(now)
+        route = self._route(adapter, port, event) if adapter is not None else None
+        if route is None:
+            return False
+        key = self._key(route)
+        root = self.roots.get(key)
+        revision = self._friend_revision(adapter, route)
+        if root is None:
+            # Retain only metadata after expiry so another mark/wrapper cannot
+            # give the same message a new 300-second data lifetime.
+            root = _ObservationRoot(route, port, adapter._connection_epoch, now+300, revision)
+            self.roots[key] = root
+            while len(self.roots) > 4096:
+                self.roots.popitem(last=False)
+            self._prune(now)
+        elif (root.route != route or root.port is not port
+                or root.epoch != adapter._connection_epoch or root.deadline <= now
+                or root.friend_revision != revision):
+            return False
+        previous = self.events.get(id(event))
+        if previous is not None:
+            return (previous.event is event and previous.source is event.source
+                    and previous.root is root)
+        while len(self.events) >= 512:
+            self.events.popitem(last=False)
+        self.events[id(event)] = _PublicObservation(event, event.source, root)
+        return True
+
+    def current(self, port, event):
+        adapter, now = self._receiver(), time.monotonic()
+        self._prune(now)
+        proof = self.events.get(id(event))
+        if (adapter is None or proof is None or proof.event is not event or proof.root.port is not port):
+            return False
+        route = self._route(adapter, port, event)
+        root = proof.root
+        valid = (getattr(event, 'source', None) is proof.source and root.epoch == adapter._connection_epoch
+                 and route == root.route and root.friend_revision == self._friend_revision(adapter, root.route)
+                 and self.roots.get(self._key(root.route)) is root and now < root.deadline)
+        if not valid:
+            self.events.pop(id(event), None)
+        return bool(valid)
+
+    def revoke_port(self, port):
+        for key, root in tuple(self.roots.items()):
+            if root.port is port:
+                self.roots.pop(key, None)
+        self._prune(time.monotonic())
+
+    def clear(self):
+        self.events.clear()
+        self.roots.clear()
 
 
 class OptionalSources:
@@ -60,8 +183,27 @@ class OptionalSources:
     def revision(self, chat):
         return self.revisions.get(chat, 0)
 
-    def advance(self, chat):
+    def _delivery_grant(self, chat, source):
+        """Only the currently executing admitted turn may retain its own grant."""
+        adapter = self._receiver()
+        grant = self.grants.get(id(source)) if source is not None else None
+        permit = adapter._group_permit.get() if adapter is not None else None
+        if (grant is None or grant[0] is not source or grant[2][0] != chat
+                or permit is None or adapter._group_permits.get(id(permit)) is not permit
+                or getattr(permit, 'source', None) is not source
+                or permit.route.chat_id != chat or permit.route.chat_type != 'group'
+                or not adapter.admit_group_source(source) or not self.valid(source)):
+            return None
+        return grant
+
+    def advance(self, chat, *, preserve_source=None):
+        grant = self._delivery_grant(chat, preserve_source)
         self.revisions[chat] = self.revision(chat) + 1
+        if grant is not None:
+            source, event, route, port, _, epoch, deadline = grant
+            # Self-delivery changes freshness for every OTHER opportunity. It
+            # does not renew the executing source, its epoch or original TTL.
+            self.grants[id(source)] = (source, event, route, port, self.revision(chat), epoch, deadline)
 
     def observe(self, event):
         key = (event.source.chat_id, event.message_id)
@@ -96,16 +238,17 @@ class OptionalSources:
             # observation of an earlier, still-live image in the same group.
             adapter._cancel_optional_media(event.source.chat_id, keep_pure_image=True)
 
-    def invalidate(self, chat=None, *, keep_pure_image=False):
+    def invalidate(self, chat=None, *, keep_pure_image=False, preserve_source=None):
         if chat is None:
             self.grants.clear()
             self.continuations.clear()
             for target in self.revisions:
                 self.advance(target)
         else:
-            self.advance(chat)
+            preserved = self._delivery_grant(chat, preserve_source)
+            self.advance(chat, preserve_source=preserve_source)
             for key, grant in list(self.grants.items()):
-                if grant[2][0] == chat:
+                if grant[2][0] == chat and (preserved is None or grant[0] is not preserve_source):
                     self.grants.pop(key, None)
                     self.continuations.pop(key,None)
         adapter = self._receiver()
@@ -182,6 +325,7 @@ class _IdleGrant:
     epoch: int
     deadline: float
     spent: bool = False
+    identity_view: object = None
 
 
 class ParticipationPort:
@@ -204,6 +348,7 @@ class ParticipationPort:
         self._controller = None
         self._idle_targets = frozenset()
         self._idle_grants = OrderedDict()
+        self._identity_views = OrderedDict()
         self._receipts = {}
         self._dispatching = {}
         self._registration_key = None
@@ -230,11 +375,122 @@ class ParticipationPort:
     def belongs_to(self, adapter):
         return self._receiver() is adapter
 
+    @property
+    def friend_dm_enabled(self):
+        adapter = self._receiver()
+        return bool(adapter is not None and adapter.settings.friend_dm.enabled)
+
+    @property
+    def public_dm_users(self):
+        adapter = self._receiver()
+        return adapter.settings.friend_dm.current_users if adapter is not None else frozenset()
+
+    def dm_allowed(self, chat):
+        adapter = self._receiver()
+        return bool(adapter is not None and adapter.public_dm_allowed(chat))
+
+    def dm_target_allowed(self, chat):
+        adapter = self._receiver()
+        return bool(adapter is not None and isinstance(chat, str) and chat.startswith('dm:')
+                    and (chat[3:] == self.owner_id or adapter.settings.friend_dm.permits_target(chat[3:])))
+
+    async def read_dialogue_refs(self, chat, message_ids):
+        """Read exact public references only; this never grants send authority."""
+        adapter = self._adapter()
+        if (not self.ready() or not isinstance(message_ids, (list, tuple)) or len(message_ids) > 8
+                or any(not isinstance(mid, str) or not re.fullmatch(r'-?[0-9]{1,20}', mid) for mid in message_ids)
+                or len(set(message_ids)) != len(message_ids)):
+            return []
+        group = isinstance(chat, str) and chat.startswith('group:') and chat[6:] in self.groups
+        if not group:
+            if not self.dm_target_allowed(chat) or chat == 'dm:'+self.owner_id:
+                return []
+            if not await adapter._verify_friend_dm(chat[3:], force=True):
+                return []
+        epoch = adapter._connection_epoch
+        def current():
+            return self.ready() and adapter._connection_epoch == epoch and (group or self.dm_allowed(chat))
+        rows = []
+        for mid in message_ids:
+            if not current() or adapter._media_recalled(chat, mid):
+                continue
+            try:
+                async with asyncio.timeout(3):
+                    message = await adapter.client.call('get_msg', {'message_id': int(mid)})
+            except Exception:
+                continue
+            if (not current() or adapter._media_recalled(chat, mid) or not isinstance(message, dict)
+                    or str(message.get('message_id')) != mid
+                    or 'self_id' in message and str(message['self_id']) != adapter.settings.self_id):
+                continue
+            author = str(message.get('user_id', ''))
+            sender = message.get('sender')
+            if (not re.fullmatch(r'[1-9][0-9]{0,19}', author) or not isinstance(sender, dict)
+                    or 'user_id' in sender and str(sender['user_id']) != author):
+                continue
+            if group:
+                if (message.get('message_type') != 'group' or str(message.get('group_id')) != chat[6:]
+                        or author != adapter.settings.self_id
+                        and not adapter.settings.isolation.allows_group_user(author, chat[6:])):
+                    continue
+                from .adapter import group_display_name
+                name = group_display_name(sender)
+            else:
+                if (message.get('message_type') != 'private' or 'group_id' in message
+                        or author not in {chat[3:], adapter.settings.self_id}
+                        or author == adapter.settings.self_id and (
+                            'target_id' in message and str(message['target_id']) != chat[3:]
+                            or 'target_id' not in message and not adapter._private_receipt_matches(chat, mid))
+                        or author == chat[3:] and 'target_id' in message
+                        and str(message['target_id']) not in {chat[3:], adapter.settings.self_id}):
+                    continue
+                from .adapter import label
+                name = label(sender.get('nickname')) or '好友'
+            segments = message.get('message')
+            if not isinstance(segments, list) or len(segments) > 512:
+                continue
+            text, reply_to = [], ''
+            malformed = False
+            for segment in segments:
+                if not isinstance(segment, dict) or not isinstance(segment.get('data'), dict):
+                    malformed = True
+                    break
+                if segment.get('type') == 'text':
+                    value = segment['data'].get('text')
+                    if not isinstance(value, str):
+                        malformed = True
+                        break
+                    text.append(value)
+                elif segment.get('type') == 'reply':
+                    value = str(segment['data'].get('id', ''))
+                    if reply_to or not re.fullmatch(r'-?[0-9]{1,20}', value):
+                        malformed = True
+                        break
+                    reply_to = value
+            text = ''.join(text)
+            if (not group and author == adapter.settings.self_id and 'target_id' not in message
+                    and not adapter._private_receipt_matches(chat, mid, text)):
+                continue
+            if not malformed and text.strip() and len(text.encode()) <= 12000:
+                rows.append(dict(message_id=mid, user_id=author, name=name, text=text,
+                                 reply_to=reply_to, role='self' if author == adapter.settings.self_id else 'member'))
+        return rows if current() else []
+
+    def forget_dialogue_refs(self, chat, message_ids):
+        adapter = self._adapter()
+        if (not isinstance(chat, str) or chat == 'dm:'+self.owner_id
+                or not (chat.startswith('group:') and chat[6:] in self.groups or self.dm_target_allowed(chat))
+                or not isinstance(message_ids, (list, tuple, set, frozenset)) or len(message_ids) > 64
+                or any(not isinstance(mid, str) or not 1 <= len(mid) <= 80 for mid in message_ids)):
+            return False
+        adapter._friend_dm_forget(chat, set(message_ids))
+        return True
+
     def bind(self, controller):
         adapter = self._adapter()
         permitted = {'dm:' + adapter.settings.owner_id} | {'group:' + g for g in adapter.settings.groups}
         targets = frozenset(controller.policy.targets)
-        if not targets.issubset(permitted):
+        if any(chat not in permitted and not self.dm_target_allowed(chat) for chat in targets):
             raise AdmissionDenied('initiative_targets_outside_channel')
         self._controller, self._idle_targets = controller, targets
 
@@ -262,11 +518,33 @@ class ParticipationPort:
     def observe_activity(self, event):
         self._adapter()._optional_sources.observe(event)
 
-    def invalidate_optional(self, chat=None, *, keep_pure_image=False):
+    def public_observation_current(self, event):
+        """Exact admitted public data only; no optional/native send authority."""
+        return self._adapter()._public_observations.current(self, event)
+
+    def public_ingress_current(self, event):
+        """Exact native group ingress, distinct from deferred opportunity grants."""
+        adapter = self._adapter()
+        check = getattr(adapter, '_group_ingress_route', None)
+        source = event.source
+        proof = getattr(adapter, '_group_ingress', {}).get(id(source))
+        if proof is None or proof[0] is not event or proof[1] is not source:
+            permit = adapter._group_permit_for_source(source)
+            return bool(self.current() and getattr(event, 'reply_expected', False)
+                and permit is not None and adapter._group_permits.get(id(permit)) is permit
+                and getattr(permit, 'event', None) is event and permit.source is source
+                and adapter.admit_group_source(source))
+        return bool(self.current() and getattr(event, 'reply_expected', False)
+                    and source.chat_type == 'group' and callable(check)
+                    and check(source, event) is not None)
+
+    def invalidate_optional(self, chat=None, *, keep_pure_image=False, preserve_source=None):
+        self._identity_views.clear()
         adapter = self._receiver()
         if adapter is not None:
             if self.current():
-                adapter._optional_sources.invalidate(chat, keep_pure_image=keep_pure_image)
+                adapter._optional_sources.invalidate(chat, keep_pure_image=keep_pure_image,
+                                                     preserve_source=preserve_source)
             else:
                 adapter._optional_sources.revoke_port(self)
         for key, grant in list(self._idle_grants.items()):
@@ -297,6 +575,9 @@ class ParticipationPort:
         if not self.ready() or chat not in self._idle_targets:
             raise AdmissionDenied('initiative_target_denied')
         if not chat.startswith('group:'):
+            if chat != 'dm:'+self.owner_id:
+                if not await adapter._verify_friend_dm(chat[3:], force=True):
+                    raise AdmissionDenied('initiative_friend_denied')
             return
         policy = adapter.settings.isolation
         payload = {'operation': 'prepare_proactive', 'schema_version': 1,
@@ -309,9 +590,27 @@ class ParticipationPort:
         if result != {'status': 'ok', 'host_contract': 4, 'digest': digest}:
             raise AdmissionDenied('initiative_worker_preparation_denied')
 
+    async def shared_identity_prompt(self, chat, task_id):
+        adapter = self._adapter()
+        if not chat.startswith('group:') or not adapter.settings.shared_identity.enabled:
+            return ''
+        if not self.ready() or chat not in self._idle_targets:
+            raise AdmissionDenied('initiative_target_denied')
+        epoch, revision = adapter._connection_epoch, adapter._optional_sources.revision(chat)
+        deadline = time.monotonic()+90
+        def current():
+            return (self.ready() and chat in self._idle_targets and epoch == adapter._connection_epoch
+                    and revision == adapter._optional_sources.revision(chat) and time.monotonic() < deadline)
+        view = await adapter.shared_identity.prepare(current)
+        while len(self._identity_views) >= 32:
+            self._identity_views.popitem(last=False)
+        self._identity_views[chat, task_id] = view
+        return view.text
+
     def claim_idle(self, chat, task_id):
         adapter = self._adapter()
         if (not self.ready() or chat not in self._idle_targets
+                or chat.startswith('dm:') and chat != 'dm:'+self.owner_id and not self.dm_allowed(chat)
                 or not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id)):
             raise AdmissionDenied('initiative_not_authorized')
         # Validate canonical current target once more at the actual boundary.
@@ -324,6 +623,7 @@ class ParticipationPort:
             self._idle_grants.popitem(last=False)
         grant = _IdleGrant(chat, task_id, adapter._optional_sources.revision(chat),
                            adapter._connection_epoch, now + 90)
+        grant.identity_view = self._identity_views.pop((chat, task_id), None)
         self._idle_grants[id(grant)] = grant
         return grant
 
@@ -331,6 +631,8 @@ class ParticipationPort:
         adapter = self._receiver()
         return (adapter is not None and isinstance(grant, _IdleGrant) and self._idle_grants.get(id(grant)) is grant
                 and not grant.spent and self.ready() and grant.chat in self._idle_targets
+                and (grant.identity_view is None or grant.identity_view.current())
+                and (not grant.chat.startswith('dm:') or grant.chat == 'dm:'+self.owner_id or self.dm_allowed(grant.chat))
                 and grant.epoch == adapter._connection_epoch
                 and grant.revision == adapter._optional_sources.revision(grant.chat)
                 and time.monotonic() < grant.deadline)
@@ -340,6 +642,11 @@ class ParticipationPort:
                 or not 1 <= len(text) <= 1000 or not text.strip() or not valid()):
             return False
         adapter = self._adapter()
+        if (grant.chat.startswith('dm:') and grant.chat != 'dm:'+self.owner_id
+                and not await adapter._verify_friend_dm(grant.chat[3:], force=True)):
+            return False
+        if not self._grant_valid(grant) or not valid():
+            return False
         adapter.binding.validate_active()
         adapter._target(grant.chat)
         # No await between last validation, durable consumption, and the sole
@@ -357,10 +664,20 @@ class ParticipationPort:
             return True
         return False
 
+    async def send_activity(self, grant, offer, consume, valid):
+        chat = getattr(offer, 'chat_id', getattr(offer, 'chat', None))
+        if (chat != getattr(grant, 'chat', None)
+                or not callable(getattr(offer, 'current', None)) or not offer.current()
+                or not isinstance(getattr(offer, 'text', None), str)):
+            return False
+        return await self.send_idle(grant, offer.text, consume,
+                                    lambda: valid() and offer.current())
+
     def consume_delivery(self, grant):
         adapter = self._adapter()
         if (not isinstance(grant, _IdleGrant) or self._dispatching.pop(id(grant), None) is not grant
                 or not grant.spent or not self.ready() or grant.chat not in self._idle_targets
+                or grant.chat.startswith('dm:') and grant.chat != 'dm:'+self.owner_id and not self.dm_allowed(grant.chat)
                 or grant.epoch != adapter._connection_epoch
                 or grant.revision != adapter._optional_sources.revision(grant.chat)
                 or time.monotonic() >= grant.deadline):
