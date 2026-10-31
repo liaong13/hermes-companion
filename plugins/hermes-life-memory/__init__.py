@@ -43,7 +43,8 @@ def register(ctx):
                 raise PermissionError('memory groups outside channel authorization')
             from plugins.plugin_storage import plugin_data_dir
             service = LifeMemoryService(home, plugin_data_dir('hermes-life-memory'), config, reader,
-                channel_domain=port.domain_id, channel_revision=port.policy_revision)
+                channel_domain=port.domain_id, channel_revision=port.policy_revision,
+                dm_allowed=getattr(port, 'dm_allowed', None))
             key = (ctx.manifest.name, factory.__qualname__)
             try:
                 adapter.install_social_memory(service, registration_key=key)

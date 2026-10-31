@@ -1,6 +1,8 @@
 # Hermes Companion · 分域记忆组件（实验性）
 
-[Hermes Companion](../../README.md) 的可选记忆提供者，发现名称为 **`scoped-memory`**，源码目录为 `hermes-scoped-memory`，清单版本为 `0.3.1`。它与人格无关，不要求每位用户一个 profile，也不会自动迁移既有云记忆。
+[Hermes Companion](../../README.md) 的可选记忆提供者，发现名称为 **`scoped-memory`**，源码目录为 `hermes-scoped-memory`，清单版本为 `0.3.2`。它与人格无关，不要求每位用户一个 profile，也不会自动迁移既有云记忆。
+
+`0.3.2` 补齐明确语义记录及普通好友 DM 的精确主体过滤，公共 API 仍为 `1`；本人确认、来源删除与过期检查由 life-memory 调用原存储合同完成。
 
 QQ／social／life-memory 成套接入使用 [INSTALL.md](../../INSTALL.md)，完整分发本目录作为数据层并保留已有私人 provider；下面启用本 provider 的实验步骤不属于基本安装。provider 与个人命令使用宿主 `hermes_yaml`，不依赖 PM 环境另有 PyYAML；当前修复与配套验证见[安装验收记录](../../docs/安装修复与统一接入验收.md)。
 

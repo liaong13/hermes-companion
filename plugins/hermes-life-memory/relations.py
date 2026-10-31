@@ -46,6 +46,9 @@ class Relations:
             db.execute('''CREATE TABLE IF NOT EXISTS life_episodes (
                 memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
                 instance_id TEXT NOT NULL, topic_id TEXT NOT NULL, UNIQUE(instance_id,topic_id))''')
+            db.execute('''CREATE TABLE IF NOT EXISTS life_explicit_episodes (
+                memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                instance_id TEXT NOT NULL)''')
             db.execute('''CREATE TABLE IF NOT EXISTS life_agreements (
                 memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
                 instance_id TEXT NOT NULL, due REAL NOT NULL, expires REAL NOT NULL,
@@ -81,6 +84,52 @@ class Relations:
                         (ident,s['id'],s['revision'],role,0,len(text),'characters',s['sha256']))
             db.execute('INSERT INTO life_episodes VALUES (?,?,?)', (ident,self.instance_id,closing['topic_id']))
             return ident
+
+    def propose_episode(self, scope, source_id, value, *, start, ttl_days):
+        if not isinstance(value, str) or not value.strip() or len(value.encode()) > 480:
+            raise ValueError('bounded explicit experience required')
+        with self.store.connection(True) as db:
+            old = db.execute('''SELECT m.id FROM memories m JOIN life_explicit_episodes e ON e.memory_id=m.id
+                WHERE m.domain=? AND m.owner=? AND m.origin=? AND m.source_id=? AND e.instance_id=?''',
+                (self.store.domain_id, *scope.pair, source_id, self.instance_id)).fetchone()
+            if old is not None:
+                return old[0]
+            count = db.execute('''SELECT COUNT(*) FROM memories m JOIN life_explicit_episodes e ON e.memory_id=m.id
+                WHERE m.domain=? AND m.owner=? AND m.origin=? AND e.instance_id=?
+                  AND m.state IN ('active','pending') AND (m.expires IS NULL OR m.expires>?)''',
+                (self.store.domain_id, *scope.pair, self.instance_id, time.time())).fetchone()[0]
+            if count >= 8:
+                raise ValueError('explicit experience limit reached')
+            ident = self.store.evidenced_in(db, scope, '本人经历陈述：'+value, source_id, role='user', start=start,
+                end=start+len(value), quote=value, associations={'event':['life:'+self.instance_id+':episode']},
+                ttl_days=ttl_days)
+            db.execute('INSERT INTO life_episodes VALUES (?,?,?)', (ident, self.instance_id, 'explicit:'+source_id))
+            db.execute('INSERT INTO life_explicit_episodes VALUES (?,?)', (ident, self.instance_id))
+            return ident
+
+    def explicit_episode(self, db, scope, ident):
+        self.store.owned(db, 'memories', ident, scope)
+        return db.execute('SELECT * FROM life_explicit_episodes WHERE memory_id=? AND instance_id=?',
+                          (ident, self.instance_id)).fetchone() is not None
+
+    def _review_episode(self, db, scope, ident):
+        if not self.explicit_episode(db, scope, ident):
+            raise PermissionError('explicit experience not in scope')
+        row, digest = self.store.candidate_in(db, scope, ident)
+        digest = hashlib.sha256(json.dumps([digest, self.instance_id, scope.pair, 'explicit_episode']).encode()).hexdigest()[:24]
+        return dict(id=ident, content=row['content'], digest=digest)
+
+    def review_episode(self, scope, ident):
+        with self.store.connection(True) as db:
+            return self._review_episode(db, scope, ident)
+
+    def decide_episode(self, scope, ident, digest, *, confirm):
+        with self.store.connection(True) as db:
+            card = self._review_episode(db, scope, ident)
+            if card['digest'] != digest:
+                raise PermissionError('explicit experience review expired')
+            db.execute('UPDATE memories SET state=? WHERE id=?', ('active' if confirm else 'rejected', ident))
+        return card
 
     @staticmethod
     def check_plan(due_text,value):
@@ -151,15 +200,17 @@ class Relations:
     def reference(self, ident):
         return hashlib.sha256((self.instance_id+':'+self.store.domain_id+':'+ident).encode()).hexdigest()
 
-    def view(self, scope, *, episodes=True, agreements=True):
+    def view(self, scope, *, episodes=True, agreements=True, explicit_episodes=False):
         records, refs = [], []
         with self.store.connection() as db:
             self.store.validate_scope(db, scope)
-            for table,kind,enabled in (('life_agreements','agreement',agreements),('life_episodes','episode',episodes)):
+            for table,kind,enabled in (('life_agreements','agreement',agreements),('life_episodes','episode',episodes or explicit_episodes)):
                 if not enabled: continue
+                explicit_filter = (" AND EXISTS(SELECT 1 FROM life_explicit_episodes x WHERE x.memory_id=m.id AND x.instance_id=r.instance_id)"
+                                   if kind == 'episode' and not episodes else '')
                 rows = db.execute('''SELECT m.* FROM memories m JOIN '''+table+''' r ON r.memory_id=m.id
                     WHERE m.domain=? AND m.owner=? AND m.origin=? AND r.instance_id=? AND m.state='active'
-                      AND (m.expires IS NULL OR m.expires>?) ORDER BY m.created DESC LIMIT 4''',
+                      AND (m.expires IS NULL OR m.expires>?)'''+explicit_filter+''' ORDER BY m.created DESC LIMIT 4''',
                     (self.store.domain_id,*scope.pair,self.instance_id,time.time())).fetchall()
                 for row in rows:
                     try:
@@ -169,6 +220,15 @@ class Relations:
                     except PermissionError:
                         continue
                     item = {'id':row['id'],'kind':kind,'content':memory_api().clip(row['content'],360)}
+                    evidence = []
+                    for proof in db.execute('''SELECT e.start,e.end,s.message_id,s.created,s.user_text FROM evidence e
+                        JOIN sources s ON s.id=e.source_id WHERE e.memory_id=? ORDER BY s.created LIMIT 4''', (row['id'],)):
+                        evidence.append(dict(message_id=proof['message_id'], observed_at=proof['created'],
+                                             quote=(proof['user_text'] or '')[proof['start']:proof['end']]))
+                    item.update(observed_at=row['created'], expires_at=row['expires'], evidence=evidence)
+                    if kind == 'episode':
+                        item['verification'] = ('subject_confirmed_statement' if self.explicit_episode(db, scope, row['id'])
+                                                else 'literal_conversation_excerpt')
                     if kind=='agreement':
                         plan = self.owns(db,scope,row['id'])
                         item.update(due=plan['due'],status=plan['status'])
@@ -177,13 +237,20 @@ class Relations:
                         refs.extend(item_refs)
         return records, tuple(refs)
 
-    def pending(self,scope):
+    def pending(self,scope, *, agreements=True, episodes=False):
         with self.store.connection() as db:
             self.store.validate_scope(db,scope)
-            return [dict(row) for row in db.execute('''SELECT m.id,m.content FROM memories m
+            rows = [dict(row) for row in db.execute('''SELECT m.id,m.content FROM memories m
                 JOIN life_agreements a ON a.memory_id=m.id WHERE m.domain=? AND m.owner=? AND m.origin=?
                   AND a.instance_id=? AND m.state='pending' AND a.expires>? ORDER BY m.created LIMIT 8''',
-                (self.store.domain_id,*scope.pair,self.instance_id,time.time()))]
+                (self.store.domain_id,*scope.pair,self.instance_id,time.time()))] if agreements else []
+            if episodes:
+                rows += [dict(row) for row in db.execute('''SELECT m.id,m.content FROM memories m
+                    JOIN life_explicit_episodes e ON e.memory_id=m.id
+                    WHERE m.domain=? AND m.owner=? AND m.origin=? AND e.instance_id=?
+                      AND m.state='pending' AND (m.expires IS NULL OR m.expires>?) ORDER BY m.created LIMIT 8''',
+                    (self.store.domain_id,*scope.pair,self.instance_id,time.time()))]
+            return rows[:8]
 
     def due(self, chat, scope_factory, validate, *, excluded=frozenset()):
         validate()

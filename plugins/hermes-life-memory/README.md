@@ -1,6 +1,6 @@
 # Hermes Life Memory
 
-独立本地人物与经历记忆插件，版本 `0.3.0`。记忆计算只使用 SQLite、原始事件和本地规则，不调用 Mem0、LLM、embedding 或本机 HTTP 推理服务。已提供显式自述、对话／话题、规则候选、共同交流摘录、本人确认的定时约定和依赖撤回；组件配置默认关闭，尚未完成真实 QQ 功能验收。
+独立本地人物与经历记忆插件，版本 `0.4.0`。存储、证据核对、召回和遗忘使用 SQLite，不调用 Mem0、embedding 或本机 HTTP 推理服务。新增[明确授权的跨天记忆](docs/跨天明确记忆.md)：群和受限普通好友私聊分别保存本人确认的事实与约定，保持原始对话采集关闭；只有本人明确请求“请记住”且本地规则不足时，适配器才可调用既有无工具模型提出待核对候选。组件配置默认关闭，源码与合成测试不等于真实 QQ 验收。
 
 完整接入使用 [INSTALL.md](../../INSTALL.md)，自动配齐四组件与对应宿主增量。首次基本安装配置显式人物候选，普通聊天采集另选 `--features local-memory`，主动约定联系另需明确目标；升级保留原选择。安装、运行加载与功能验收的区别见[安装验收记录](../../docs/安装修复与统一接入验收.md)。
 
@@ -8,10 +8,10 @@
 
 ## 已实现的范围
 
-- 仅接受已获准 NapCat 群中的原始纯文本命令，可信成员 ID 决定资料主体。昵称相同不合并；他人、引用消息、机器人回复和模型工具请求不能代为确认。
+- 接受已获准 NapCat 群，以及显式 `friend_dm=true` 后经通道当前资格核验的普通好友私聊原始纯文本命令。可信成员 ID 决定资料主体。昵称相同不合并；他人、引用消息、机器人回复和模型工具请求不能代为确认。
 - 支持 `interest`（兴趣）、`preference`（交流偏好）、`boundary`（联系边界）三个字段。每个成员／群／伙伴实例的同一字段只有一个生效版本；确认新值时保留修订关系。
-- 资料明确记录伙伴实例、`subject_id`、`asserted_by`、来源修订、证据片段与当前群可见范围。人物资料不跨群、私聊、其他成员或 idle；真实同群 bot 引用只带公开消息的依赖元数据，不开放被引用成员的档案或原文读取。
-- 通过 NapCat 合同 1 的 `install_social_memory` 接线，复用原有合同 5 公共群回合及 worker 准入。没有第二个连接、MemoryProvider 注册或模型调用；不会替换 default 的 Mem0。
+- 资料明确记录伙伴实例、`subject_id`、`asserted_by`、来源修订、证据片段与精确场所范围。群资料、每位好友的 DM、其他成员与 idle 相互隔离；真实同群 bot 引用只带公开消息的依赖元数据，不开放被引用成员的档案或原文读取。
+- 通过 NapCat 合同 1 的 `install_social_memory` 接线，复用原有合同 5 公共群回合及受限好友路径。没有第二个连接或 MemoryProvider 注册，不会替换私人 Mem0；可选语义候选模型仅接收本轮明确授权自述。
 - 召回最多八条、每个值最多 480 UTF-8 bytes，仅加入当前回合的临时上下文；不改原始 `event.text`。忘记、来源撤回／修订、策略失效、卸载与断线会使相关在途工具和发送许可失效。
 
 本地存储不等于本地推理：启用后，已确认且适用于当前成员的资料会随公开群回合发送给所配置的对话模型。群中的 review 回复也会展示本人资料。不要填写秘密或不愿在该群展示的信息。
@@ -20,7 +20,7 @@
 
 ## 接入前提与配置
 
-需要本仓库匹配版本的 `hermes-napcat`（`0.5.0`，`social_memory_contract = 1`）、已启用的 `hermes-social 0.2.0`，以及完整的 `hermes-scoped-memory 0.3.1` 源码。通过版本化公共入口 `api.py / API_VERSION=1` 复用数据层；完整目录仍须同级分发，尚未拆成独立 pip 包。只有 `isolated_worker.py` 的安装副本不够。该依赖不要求启用 scoped-memory provider，也不调用其 `register` 或读取 Mem0 配置。
+需要本仓库匹配版本的 `hermes-napcat`（`social_memory_contract = 1`）、已启用的 `hermes-social`，以及完整的 `hermes-scoped-memory` 源码。通过版本化公共入口 `api.py / API_VERSION=1` 复用数据层；人物 API 兼容扩展为精确 peer 的 DM，不改变原群规则。完整目录仍须同级分发，只有 `isolated_worker.py` 的安装副本不够。该依赖不要求启用 scoped-memory provider，也不调用其 `register` 或读取 Mem0 配置。
 
 ```text
 <profile-home>/plugins/
@@ -42,12 +42,13 @@ hermes config set plugins.entries.hermes-life-memory.settings.memory '{"enabled"
 
 当前核对的 SDK 定向 `unload(owner)` 不移除平台工厂列表，旧工厂可能占据相同 wire key。本轮验证的是完整插件重新发现（先 unload-all，再注册新一代）后的附着与资料恢复；定向卸载能立即撤权，但不能据此承诺任意定向重新启用。实际重载仍须在获准环境单独执行。
 
-## 群内命令
+## 本人命令
 
-直接发送纯文本，不需要 @，只处理已授权群中的本人资料：
+直接发送纯文本，不需要 @，只处理已授权群或显式获准好友 DM 中的本人资料：
 
 ```text
 /social-memory remember interest 我喜欢讨论天文学
+/social-memory episode 我们在合成工坊核对过纸卡编号
 /social-memory pending
 /social-memory review <ID>
 /social-memory confirm <ID> <核对码>
@@ -60,13 +61,13 @@ hermes config set plugins.entries.hermes-life-memory.settings.memory '{"enabled"
 /social-memory forget <ID>
 ```
 
-`remember` 仅创建候选。`review` 返回内容、使用范围及精确确认／拒绝命令；本人执行确认后才能作为人物事实召回。其他群或成员复制 ID 和核对码无效。修订同一字段时重新 remember／review／confirm；另有下述规则候选，尚无通用语义提取或自然语言控制命令识别。
+`remember` 仅创建候选。`review` 返回内容、原文片段、有效期、使用范围及精确确认／拒绝命令；本人执行确认后才能作为人物事实召回。其他群、好友或成员复制 ID 和核对码无效。修订同一字段时重新 remember／review／confirm。`explicit_memory.enabled=true` 还接受“请记住：我喜欢……”一类明确本人授权，仍须 review／confirm；普通闲聊不会因此自动存档，不提供任意自然语言管理命令。
 
 可选 `conversation.enabled=true` 与 `candidates.enabled=true` 会从已准入、实际交给公共群回合的原始文本识别少量明确自述，例如“我喜欢天文学”“我希望你回复简短一些”。引号、转述、假设、疑问和混合复杂句保持未知；规则候选仍须本人核对，原始聊天记录不等于已确认事实。默认最多 8 条待核对候选，规则候选有效期 30 天；重复原事件不会重新创建已拒绝或已忘记的条目。
 
 对话原文最多 2000 UTF-8 bytes，超限输入不采集、不产生候选，普通问答仍按原通道处理。对话默认保留 7 天、每人每群最多 200 条有效事件；已确认人物资料、共同经历及约定的有效证据保留到对应条目失效或忘记，过期对话不再整段注入。话题依据真实回复、关键词和短时续问规则，尚无通用语义理解。
 
-另可开启 `episodes.enabled=true` 和 `agreements.enabled=true`，均依赖对话采集。共同经历是带证据的字面交流摘录；约定必须提供带时区的明确未来时间、经本人核对确认。`agreements.proactive=true` 与本人确认同时成立后，才可经 social 的原群目标、统一额度及 NapCat 成员检查提起一次；普通人物偏好仍不供 idle 读取。`cancel`／`close` 撤销来源及派生，close 不是外部任务完成证明。详细默认值、命令及反馈语义见最新阶段文档。
+另可开启 `episodes.enabled=true` 和 `agreements.enabled=true`。自动共同交流摘录仍依赖对话采集；明确的 `/social-memory episode <本人经历>` 则在 `explicit_memory.enabled=true` 时创建待本人核对候选，不采集完整聊天，也不代表其他参与者确认了该经历。约定也可在显式模式且原始采集关闭时，仅保存明确授权的时间与约定片段。约定必须提供带时区的明确未来时间、经本人核对确认。`agreements.proactive=true` 与本人确认同时成立后，才可经 social 的原群目标、统一额度及 NapCat 成员检查提起一次；好友 DM 约定当前仅供本人续聊召回，不自动获得主动联系授权。普通人物偏好仍不供 idle 读取。`cancel`／`close` 撤销来源及派生，close 不是外部任务完成证明。
 
 开启对话记录必须同时启用 NapCat `local_conversation_context=true` 并具备[本地上下文宿主增量](../../integration/hermes-host/napcat-local-memory-context.md)。它对该适配器的公共群回合使用新 Agent 与空宿主历史，交流连续性来自有效本地事件；插件停用后仍不自动回落旧历史。缺少宿主合同会拒绝开启，不能仅设置 memory 开关后声称已接通。
 

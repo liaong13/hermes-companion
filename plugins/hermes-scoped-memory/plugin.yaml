@@ -1,5 +1,5 @@
 name: scoped-memory
-version: 0.3.1
+version: 0.3.2
 license: MIT
 description: Fail-closed owner Mem0 and local origin-scoped memory router
 hooks:

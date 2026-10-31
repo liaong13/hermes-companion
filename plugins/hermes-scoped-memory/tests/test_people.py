@@ -67,16 +67,39 @@ def test_other_member_same_display_name_or_other_group_cannot_read_or_decide(peo
     assert people.store.get(sc, ident)['state'] == 'pending'
 
 
-def test_other_instance_no_subject_reassignment_or_private_scope(people):
+def test_other_instance_no_subject_reassignment_or_foreign_dm_scope(people):
     sc = scope(people)
     ident = proposal(people, sc)
     other = PeopleMemory(people.store, 'another-companion')
     assert other.recall(sc).facts == ()
     with pytest.raises(PermissionError): other.review(sc, ident)
-    for invalid in (replace(sc, origin_kind='dm', origin_id='dm:20002'),
+    for invalid in (replace(sc, origin_kind='dm', origin_id='dm:30003'),
             replace(sc, thread_id='other'), replace(sc, platform='other'),
             replace(sc, principal_id='user-supplied-name')):
         with pytest.raises(PermissionError): people.recall(invalid)
+
+
+def test_exact_peer_dm_reuses_confirmation_without_group_or_other_peer_access(people):
+    dm = people.store.resolve_scope(ScopeContext('people-test', 'napcat', 'napcat:20002',
+        'dm', 'dm:20002', session_id='person', message_id='1'))
+    ident = proposal(people, dm)
+    card = people.review(dm, ident)
+    other = people.store.resolve_scope(ScopeContext('people-test', 'napcat', 'napcat:30003',
+        'dm', 'dm:30003', session_id='person', message_id='2'))
+    assert people.recall(other).facts == ()
+    with pytest.raises(PermissionError): people.decide(other, ident, card['digest'], confirm=True)
+    confirm(people, dm, ident)
+    assert people.recall(dm).facts[0]['content'] == '兴趣：拿铁'
+    assert people.recall(scope(people)).facts == ()
+    with people.store.connection() as db:
+        row = db.execute('SELECT subject_id,asserted_by FROM person_facts WHERE memory_id=?', (ident,)).fetchone()
+        assert row['subject_id'] == row['asserted_by'] == 'napcat:20002'
+
+
+def test_mismatched_dm_peer_is_rejected_before_any_store_read(people, monkeypatch):
+    invalid = ScopeContext('people-test', 'napcat', 'napcat:20002', 'dm', 'dm:30003')
+    monkeypatch.setattr(people.store, 'snapshot', lambda scope: pytest.fail('must reject before storage access'))
+    with pytest.raises(PermissionError): people.recall(invalid)
 
 
 @pytest.mark.parametrize('change', ['source_revision','purge','expire','policy','forget'])

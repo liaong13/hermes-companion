@@ -44,11 +44,15 @@ class PeopleMemory:
                 UNIQUE(instance_id,memory_id))''')
 
     def _scope(self, scope):
+        peer = scope.principal_id.partition(':')[2] if isinstance(scope, ScopeContext) else ''
+        origin_allowed = (isinstance(scope, ScopeContext) and (
+            scope.origin_kind == 'group' and re.fullmatch(r'group:[1-9][0-9]{0,19}', scope.origin_id) is not None
+            or scope.origin_kind == 'dm' and scope.origin_id == 'dm:'+peer))
         if (not isinstance(scope, ScopeContext) or scope.platform != 'napcat'
-                or scope.origin_kind != 'group' or scope.thread_id
+                or not origin_allowed or scope.thread_id
                 or re.fullmatch(r'napcat:[1-9][0-9]{0,19}', scope.principal_id) is None
-                or re.fullmatch(r'group:[1-9][0-9]{0,19}', scope.origin_id) is None):
-            raise PermissionError('authenticated group member scope required')
+                ):
+            raise PermissionError('authenticated exact-origin member scope required')
         self.store.snapshot(scope)
 
     def propose(self, scope, source_id, field, value, *, start, ttl_days=None):
