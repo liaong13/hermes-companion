@@ -13,7 +13,7 @@ import tempfile
 from .settings import SetupError
 
 
-PATCHES = ('napcat-public-turn', 'napcat-social-participation', 'napcat-ambient-quiet',
+PATCHES = ('napcat-public-turn', 'napcat-social-participation', 'napcat-ambient-quiet', 'napcat-shared-identity',
            'napcat-local-memory-context')
 
 
@@ -84,16 +84,44 @@ def helper(python, repo, host, home, operation, payload=None):
 
 def patch_overlay(repo, host, local_memory):
     patches = {name: repo/'integration/hermes-host'/(name+'.patch') for name in PATCHES}
+    sections = {}
     targets = set()
-    for patch in patches.values():
-        for line in patch.read_text().splitlines():
-            if line.startswith('+++ b/'):
-                name = line[6:]
-                if Path(name).is_absolute() or '..' in Path(name).parts:
-                    raise SetupError('补丁包含越界目标。')
-                targets.add(name)
+    for patch_name, patch in patches.items():
+        blocks = []
+        lines = patch.read_text().splitlines(keepends=True)
+        for index,line in enumerate(lines):
+            unified_header = (line.startswith('--- ') and index+1<len(lines)
+                              and lines[index+1].startswith('+++ '))
+            if (line.startswith('diff --git ') or unified_header
+                    and (not blocks or any(item.startswith('+++ ') for item in blocks[-1]))):
+                blocks.append([])
+            if not blocks:
+                # git apply accepts optional mail headers before the first diff.
+                continue
+            blocks[-1].append(line)
+        grouped = {}
+        for block in blocks:
+            paths = [line[6:].strip() for line in block if line.startswith('+++ b/')]
+            if len(paths) != 1:
+                raise SetupError('宿主补丁包含不支持的文件边界：'+patch_name)
+            name = paths[0]
+            if (not name or Path(name).is_absolute() or '..' in Path(name).parts
+                    or any(ord(char)<32 for char in name)):
+                raise SetupError('补丁包含越界目标。')
+            targets.add(name)
+            grouped.setdefault(name,[]).extend(block)
+        if not grouped:
+            raise SetupError('宿主补丁没有文件变更：'+patch_name)
+        sections[patch_name] = {name:''.join(block) for name,block in grouped.items()}
     with tempfile.TemporaryDirectory(prefix='companion-host-plan-') as directory:
         overlay = Path(directory)
+        # A caller's Git location or an outer repository must never redirect
+        # this disposable composition or make git apply silently skip paths.
+        git_env = {key:value for key,value in os.environ.items() if not key.startswith('GIT_')}
+        git_env.update(GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_SYSTEM=os.devnull,
+                       GIT_CONFIG_NOSYSTEM='1')
+        run(['git','init','--quiet','--template='],cwd=overlay,env=git_env)
+        git = ['git','--git-dir='+str(overlay/'.git'),'--work-tree='+str(overlay)]
         original = {}
         for name in targets:
             path = host/name
@@ -105,25 +133,54 @@ def patch_overlay(repo, host, local_memory):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(original[name])
         applied = set()
-        def check(name, reverse=False):
-            command = ['git', 'apply', '--check', *(['--reverse'] if reverse else []), str(patches[name])]
-            return subprocess.run(command, cwd=overlay, capture_output=True).returncode == 0
+        repaired = set()
+        def check(name, reverse=False, section=None):
+            command = [*git,'apply','--check',*(['--reverse'] if reverse else []),
+                       '-' if section is not None else str(patches[name])]
+            return subprocess.run(command,cwd=overlay,env=git_env,input=section,
+                                  text=True,capture_output=True).returncode == 0
+        def apply(name, reverse=False, section=None):
+            run([*git,'apply',*(['--reverse'] if reverse else []),
+                 '-' if section is not None else patches[name]],
+                cwd=overlay,env=git_env,input=section)
         # Later increments overlap earlier hunks; unwrap the entire stack first.
         for name in reversed(PATCHES):
             if check(name, True):
-                run(['git', 'apply', '--reverse', patches[name]], cwd=overlay)
+                apply(name,True)
                 applied.add(name)
+                continue
+            backwards = {path for path,section in sections[name].items()
+                         if check(name,True,section)}
+            if not backwards:
+                # A clean host cannot apply a later increment before its base
+                # exists. Validate the whole increment after forward replay.
+                continue
+            for path,section in sections[name].items():
+                if path not in backwards and not check(name,False,section):
+                    raise SetupError('宿主补丁文件存在冲突：'+name+' / '+path+'；未修改目标宿主。')
+            # Repair only complete file sections. A partially edited file is
+            # an explicit conflict; never guess hunks or replace custom code.
+            for path,section in sections[name].items():
+                if path in backwards:
+                    apply(name,True,section)
+            applied.add(name)
+            repaired.add(name)
         needed = set(PATCHES if local_memory else PATCHES[:-1]) | applied
         for name in PATCHES:
             if name not in needed:
                 continue
             if not check(name):
+                conflicts = [path for path,section in sections[name].items()
+                             if not check(name,False,section)]
+                if conflicts:
+                    raise SetupError('宿主补丁文件存在冲突：'+name+' / '+conflicts[0]+'；未修改目标宿主。')
                 raise SetupError('宿主补丁不能无冲突组合：'+name+'；未修改目标宿主。')
-            run(['git', 'apply', patches[name]], cwd=overlay)
+            apply(name)
         changes = {name: (overlay/name).read_bytes() for name in targets
                    if (overlay/name).exists() and (overlay/name).read_bytes() != original.get(name)}
         for name, content in changes.items():
             if name.endswith('.py'):
                 compile(content, name, 'exec')
-        return changes, {name: ('already_applied' if name in applied else 'will_apply')
+        return changes, {name: ('repair_partial' if name in repaired else
+                               'already_applied' if name in applied else 'will_apply')
                          for name in PATCHES if name in needed}

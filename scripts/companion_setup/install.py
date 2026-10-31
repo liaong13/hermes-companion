@@ -165,6 +165,7 @@ def public_plan(plan):
     memory = entries['hermes-life-memory']['settings']['memory']
     social = entries['hermes-social']['settings']['channels']['napcat']
     extra = plan['updates']['platforms.napcat']['extra']
+    friend = extra.get('friend_dm') or {}
     return {'status': 'planned', 'home': str(plan['home']), 'host': str(plan['host']),
             'source': plan['source'],
             'source_revision': plan['revision'], 'source_dirty': plan['dirty'],
@@ -172,8 +173,25 @@ def public_plan(plan):
             'versions': plan.get('versions', {}),
             'configuration': {'group_admission': extra['group_admission'], 'allowed_group_count': len(extra['allowed_groups']),
                               'social_enabled': social['enabled'], 'idle_target_count': len(social['targets']),
+                              'friend_dm_enabled': bool(friend.get('enabled',
+                                                        bool(extra['isolation'].get('guest_dm_users')))),
+                              'friend_admission': friend.get('admission', 'explicit'),
+                              'friend_user_count': len(set(friend.get('users', []))
+                                                       | set(extra['isolation'].get('guest_dm_users', []))),
+                              'friend_media': bool(friend.get('media', False)),
+                              'friend_group_members': bool(friend.get('allow_group_members', False)),
+                              'shared_persona': bool(extra.get('shared_identity', {}).get('enabled', False)),
+                              'shared_daily_memory': bool(extra.get('shared_identity', {}).get('daily_memory', False)),
+                              'dialogue_proactive': bool(social.get('dialogue', {}).get('proactive', False)),
+                              'activities_enabled': bool(social.get('activities', {}).get('enabled', False)),
+                              'reading_source_count': sum(len(urls) for urls in social.get('activities', {}).get('sources', {}).values()),
+                              'learning_enabled': bool(social.get('learning', {}).get('enabled', False)),
                               'memory_enabled': memory['enabled'], 'memory_group_count': len(memory['groups']),
                               'conversation_enabled': bool(memory.get('conversation', {}).get('enabled')),
+                              'request_orchestration': bool(social.get('dialogue', {}).get('orchestration')),
+                              'semantic_methods': bool(social.get('learning', {}).get('semantic')),
+                              'explicit_semantic_memory': bool(memory.get('explicit_memory', {}).get('enabled')),
+                              'friend_memory': bool(memory.get('friend_dm')),
                               'agreements_proactive': bool(memory.get('agreements', {}).get('proactive'))},
             'distribution_files': len(plan['files']), 'host_patches': plan['patches'],
             'host_files_to_change': sorted(plan['host_changes']),
@@ -311,6 +329,20 @@ def parser():
     for name in ('self-id', 'owner-id', 'groups', 'memory-groups', 'name', 'ws-url', 'runtime-home', 'idle-groups'):
         p.add_argument('--'+name)
     p.add_argument('--features', choices=('basic', 'local-memory'))
+    p.add_argument('--share-persona', action='store_true', help='显式允许群回合读取当前 profile 的 SOUL.md')
+    p.add_argument('--share-daily-memory', action='store_true',
+                   help='显式允许私密侧筛选内置 MEMORY/USER 中的非敏感日常经历；含共享人格，不加载私聊原文')
+    p.add_argument('--friend-users', help='逗号分隔的独立普通好友白名单；显式启用受限私聊，不加入 allowed_users')
+    p.add_argument('--friend-media', action='store_true', help='显式允许已获准好友复用既有媒体解析权限；不自动开云模态')
+    p.add_argument('--friend-group-members', action='store_true',
+                   help='显式允许白名单群当前成员中的已核验普通好友受限私聊；不自动添加主动目标')
+    p.add_argument('--idle-friends', help='逗号分隔的主动私聊好友；必须属于独立显式好友名单，不自动授权群友')
+    p.add_argument('--complete-social', action='store_true',
+                   help='显式启用模型社交、话题续接、阅读活动及反馈试验；不增加目标、来源或原始对话记忆')
+    p.add_argument('--enhance-social', action='store_true',
+                   help='显式启用多人事项编排、本人核对的跨天记忆和经验证的方法学习；保留原文采集、阅读来源及主动范围')
+    p.add_argument('--reading-sources', type=Path,
+                   help='JSON 文件：精确 group:<id>/dm:<id> 映射到公开 HTTPS URL 列表，替换旧阅读来源')
     p.add_argument('--group-admission', choices=('allowed_users', 'all_members'), help='显式调整成员准入；升级默认保留')
     p.add_argument('--proactive-agreements', action='store_true')
     p.add_argument('--enable-social', action='store_true', help='显式恢复既有停用的 social；普通升级保留停用选择')

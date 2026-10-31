@@ -48,11 +48,13 @@ def main():
         people = load('_companion_setup_life', root/'hermes-life-memory')
         social = load('_companion_setup_social', root/'hermes-social')
         extra = payload['updates']['platforms.napcat']['extra']
-        channel.adapter.Settings(extra)
+        channel_settings = channel.adapter.Settings(extra)
         entries = payload['updates']['plugins.entries']
         people.service.settings(entries['hermes-life-memory']['settings']['memory'])
         social.SocialPolicy(entries['hermes-social']['settings']['channels']['napcat'],
-                            owner_id=extra['owner_id'], groups=frozenset(extra['allowed_groups']))
+                            owner_id=extra['owner_id'], groups=frozenset(extra['allowed_groups']),
+                            dm_target_allowed=lambda chat: isinstance(chat, str) and chat.startswith('dm:')
+                            and channel_settings.friend_dm.permits_target(chat[3:]))
         versions = {}
         for name in ('hermes-napcat', 'hermes-life-memory', 'hermes-social', 'hermes-scoped-memory'):
             manifest = safe_load((root/name/'plugin.yaml').read_text())

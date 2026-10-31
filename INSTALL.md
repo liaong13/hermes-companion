@@ -43,11 +43,69 @@ python3 scripts/install.py --apply --restart
 6. 备份本次精确目标，通过 Hermes CLI 合并配置、通过宿主凭据接口保存 token；使用 Hermes PM 准备 Python 依赖，不调用原始 pip 或 uv。
 7. 检查真实隔离 worker，核对配置和安装文件读回；按 `--restart` 使用官方 gateway 命令启动／重载，并核对目标 home 的 NapCat 连接状态。全程不发送测试 QQ 消息。
 
-配置只接入指定群、主人私聊和公共群工具路径。既有 SOUL、MEMORY、USER、聊天历史、Mem0 主体及其他插件配置不会被导出或替换；`memory.provider` 保留。scoped-memory 在这里是 life-memory 的数据层，不是第二个被激活的 memory provider。
+配置接入指定群、主人私聊和公共群工具路径；普通好友另需下述独立名单。既有 SOUL、MEMORY、USER、聊天历史、Mem0 主体及其他插件配置不会被导出或替换；`memory.provider` 保留。scoped-memory 在这里是 life-memory 的数据层，不是第二个被激活的 memory provider。
 
 默认关闭 NapCat 的宿主启动通知：它没有当前消息回复许可，与 strict 通道合同不兼容。正常回复、可选接话及经过独立授权的联系各自保留许可检查。发送拒绝或未知送达不进行纯文本重发。
 
+## 普通好友与完整社交
+
+已有完整社交安装可显式启用[多人请求编排、跨天记忆与方法学习](docs/多人请求编排跨天记忆与方法学习.md)：
+
+```sh
+python3 scripts/install.py --enhance-social
+python3 scripts/install.py --enhance-social --apply --restart
+```
+
+此选项启用 `dialogue.orchestration`、`learning.semantic/semantic_auto_trials`、life-memory 的 `memory.explicit_memory` 与约定，并为已启用的普通好友入口启用精确 DM 记忆。它复用既有好友／群范围、主动目标、阅读来源和安静时段，不启用原始聊天采集，不切换私人 memory provider。若一个停用的 life 插件保存着旧原始采集开关，安装器会阻挡隐式恢复；需明确选择 `--features basic` 或单独审阅采集授权。
+
+安装器可以在一次性 Git 覆盖层修复“部分文件已打、其余文件仍是干净基线”的宿主补丁；同一文件内无法整体正／反向应用的差异继续阻挡，不猜测或覆盖现有改动。
+
+`--friend-users` 接收逗号分隔的明确普通好友 QQ，写入独立的 `friend_dm.users`，不会加入主人入口的 `allowed_users`。名单内用户还须由真实好友名单核验，才能进入无工具、无私人历史的受限社交私聊。需要允许白名单群成员中的普通好友私聊时，另加 `--friend-group-members`；它要求真实好友资格与当前允许群成员资格同时成立，不接受临时会话、用户自报群号或昵称代替核验。未加此参数、也无既有启用配置时，群友不会自动获准私聊。普通升级保留现有 `friend_dm` 与旧 `guest_dm_users`；旧名单仍须属于既有 `allowed_users`，不会为迁移自动扩大该白名单。
+
+```sh
+# 合成号码；替换成用户明确允许的普通好友
+python3 scripts/install.py --friend-users 100000004,100000005
+
+# 允许白名单群当前成员中的真实普通好友受限私聊；不增加主动目标
+python3 scripts/install.py --friend-group-members --friend-users 100000004,100000005
+
+# 主动私聊是另一项授权；只能选独立显式好友名单内的人
+python3 scripts/install.py --friend-users 100000004,100000005 --idle-friends 100000004
+```
+
+`--idle-friends` 只调整普通好友主动目标，保留既有群和主人目标；`--idle-groups` 沿用原有显式目标选择语义。`--friend-media` 另行允许已获准好友复用既有媒体设置，仍须 `media.enabled/types/cloud` 允许，不会自动开启云模态。范围、运行时资格和发送回执均沿[普通好友私聊](plugins/hermes-napcat/docs/普通好友私聊.md)的受控路径复核。
+
+`--complete-social` 显式启用 social 与模型主动模式，打开 `dialogue.enabled/proactive`、`activities.enabled/proactive`、`learning.enabled/auto_trials`。它保留安静时段、预算、已有目标和阅读来源，不自动增加目标或 URL，也不打开原始对话采集、life-memory 或另一个记忆 provider。没有主动目标时仍不会主动发消息；没有来源时不会自行上网选择阅读材料。
+
+`--reading-sources /path/to/sources.json` 将阅读来源替换为用户提供的精确场所映射。JSON 内容示意：
+
+```json
+{
+  "group:100000003": ["https://example.invalid/user-chosen-document"],
+  "dm:100000004": ["https://example.invalid/another-user-chosen-document"]
+}
+```
+
+示例地址仅表示结构，必须替换成用户选择的公开 HTTPS 文档。映射只可使用已观察的允许群或明确主动好友目标；好友来源需配合 `--idle-friends`。安装器不提供默认 URL，拒绝超出场所范围的映射；运行读取仍校验公网地址、准确 URL 和内容预算。组合参数示例：
+
+```sh
+python3 scripts/install.py --friend-users 100000004 --idle-friends 100000004 \
+  --complete-social --reading-sources /path/to/sources.json
+```
+
+先检查只读计划中的好友数、目标数和来源数；已授权安装时沿用相同参数追加 `--apply --restart`。
+
 ## 记忆功能选项
+
+群聊要沿用当前 Hermes profile 的人格时，显式使用 `--share-persona`；需要接续智能体自身及与主人、朋友的非敏感日常经历时，使用 `--share-daily-memory`（包含共享人格）：
+
+```sh
+python3 scripts/install.py --share-daily-memory
+# 已要求安装并需要激活时，在核对计划后沿用相同选项：
+python3 scripts/install.py --share-daily-memory --apply --restart
+```
+
+该选项只面向合同 5 的获准群，包括正常点名、自然接话和已授权的群空闲开口；不扩大好友私聊或主动目标。群回合使用同一份 `SOUL.md`，不复制或改写人格文件。内置 `memories/MEMORY.md`、`memories/USER.md` 只供私密侧的无工具筛选与独立审核；群回合只得到匿名的非敏感摘要。明确要求保密、限定对象可见、凭据及敏感个人资料排除，不把别人的经历或偏好认领到当前发言者。审核失败或不确定时不带入日常记忆。它不导入私聊原文、其他群历史或 Mem0 数据库，也不启用新的采集或 provider。每个含记忆的群回合至多增加两次既有模型调用；语义审核降低泄露风险，不是绝对保密保证。详细边界见[共享人格与日常记忆](plugins/hermes-napcat/docs/共享人格与日常记忆.md)。
 
 首次基本接入提供自然接话和本人明确确认的人物候选，不自动采集普通对话。升级且未指定功能选项时保留已有选择。
 

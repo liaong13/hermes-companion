@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
@@ -24,6 +25,32 @@ def ids(value, label):
     if any(not isinstance(v, str) or not re.fullmatch(r'[1-9][0-9]{0,19}', v) for v in values):
         raise SetupError(f'{label} 必须是明确的数字 ID。')
     return list(dict.fromkeys(values))
+
+
+def reading_sources(path):
+    """Only caller-supplied exact mappings; never introduce example URLs."""
+    def mapping(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate source scope')
+            result[key] = value
+        return result
+    try:
+        with Path(path).expanduser().open('rb') as stream:
+            content = stream.read(65537)
+        if len(content) > 65536:
+            raise ValueError('source mapping too large')
+        sources = json.loads(content.decode('utf-8'), object_pairs_hook=mapping)
+        if (not isinstance(sources, dict) or len(sources) > 16
+                or any(not isinstance(chat, str) or not re.fullmatch(r'(?:group|dm):[1-9][0-9]{0,19}', chat)
+                       or not isinstance(urls, list) or not 1 <= len(urls) <= 16
+                       or any(not isinstance(url, str) or not url or len(url) > 2048 for url in urls)
+                       or len(set(urls)) != len(urls) for chat, urls in sources.items())):
+            raise ValueError('invalid source mapping')
+        return sources
+    except (OSError, UnicodeError, ValueError, TypeError):
+        raise SetupError('--reading-sources 需要不超过 64 KiB 的 JSON 对象：精确 chat ID -> 不重复的公开 HTTPS URL 列表。') from None
 
 
 def build_settings(current, options, home):
@@ -52,11 +79,10 @@ def build_settings(current, options, home):
     if options.get('name'):
         trigger = {'mode': 'name_or_mention', 'name': options['name']}
     policy = deepcopy(extra.get('isolation', {}))
-    if policy.get('guest_dm_users'):
-        raise SetupError('当前完整接线不支持旧 guest DM；请先审阅该能力的迁移。')
     policy.setdefault('domain_id', 'napcat-public')
     policy.setdefault('policy_revision', 1)
-    policy.update(mode='strict', private_profile='default', social_profile='social', guest_dm_users=[])
+    policy.setdefault('guest_dm_users', [])
+    policy.update(mode='strict', private_profile='default', social_profile='social')
     runtime = deepcopy(extra.get('runtime', {}))
     key = hashlib.sha256(str(home).encode()).hexdigest()[:12]
     default_worker = Path.home()/'.local/share/hermes-companion'/key/'worker'
@@ -70,11 +96,53 @@ def build_settings(current, options, home):
     runtime.update(mode='social_agent', contract=5, social_home=str(worker))
     users = [owner if user == extra.get('owner_id') else user for user in extra.get('allowed_users', [])]
     users = list(dict.fromkeys([*users, owner]))
+    guests = policy['guest_dm_users']
+    if (not isinstance(guests, list) or any(not isinstance(user, str)
+            or not re.fullmatch(r'[1-9][0-9]{0,19}', user) or user in {owner, account} for user in guests)
+            or not set(guests).issubset(users)):
+        raise SetupError('旧 guest_dm_users 必须仍是既有 allowed_users 中明确允许的非主人好友；不会自动扩大私人白名单。')
+    friend = deepcopy(extra.get('friend_dm'))
+    if friend is not None and not isinstance(friend, dict):
+        raise SetupError('已有 friend_dm 必须是明确配置对象。')
+    if options.get('friend_users') is not None:
+        permitted = ids(options['friend_users'], '受限好友 friend_users')
+        if set(permitted) & {owner, account}:
+            raise SetupError('friend_users 只能包含非主人、非机器人账号。')
+        friend = {} if friend is None else friend
+        friend.update(enabled=True, admission='explicit', users=permitted)
+    if options.get('friend_group_members'):
+        friend = {} if friend is None else friend
+        friend.update(enabled=True, allow_group_members=True)
+    if options.get('friend_media'):
+        if friend is None and guests:
+            friend = dict(enabled=True, admission='explicit', users=[])
+        if not friend or friend.get('enabled') is not True:
+            raise SetupError('--friend-media 需要既有启用的好友配置或同时指定 --friend-users；不会自动开放好友。')
+        friend['media'] = True
+    if friend is not None:
+        extra['friend_dm'] = friend
+    friend_enabled = bool(friend.get('enabled', False)) if friend is not None else bool(guests)
+    friend_users = set(guests)
+    if friend is not None:
+        configured_users = friend.get('users', [])
+        if (not isinstance(configured_users, list) or any(not isinstance(user, str)
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', user) or user in {owner, account} for user in configured_users)):
+            raise SetupError('friend_dm.users 必须是明确允许的普通好友数字 ID。')
+        friend_users.update(configured_users)
     admission = options.get('group_admission') or extra.get('group_admission',
                                                         'allowed_users' if existing_channel else 'all_members')
     extra.update(ws_url=url, self_id=account, owner_id=owner, allowed_users=users,
                  allowed_groups=groups, require_mention=True, typing=False,
                  group_admission=admission, group_trigger=trigger, isolation=policy, runtime=runtime)
+    shared = deepcopy(extra.get('shared_identity', {}))
+    if not isinstance(shared, dict):
+        raise SetupError('已有 shared_identity 必须是明确配置对象。')
+    if options.get('share_persona') or options.get('share_daily_memory'):
+        shared['enabled'] = True
+    if options.get('share_daily_memory'):
+        shared['daily_memory'] = True
+    if shared:
+        extra['shared_identity'] = shared
     entries = deepcopy(cfg.get('plugins', {}).get('entries', {}))
     stopped = set(cfg.get('plugins', {}).get('disabled', []))
     previous_life = entries.get('hermes-life-memory', {}).get('settings', {}).get('memory')
@@ -108,14 +176,36 @@ def build_settings(current, options, home):
     social.setdefault('enabled', previous_social is None)
     if 'hermes-social' in stopped:
         social['enabled'] = False
-    if options.get('enable_social'):
+    if options.get('enable_social') or options.get('complete_social') or options.get('enhance_social'):
         social['enabled'] = True
+    if options.get('enhance_social'):
+        if not life['enabled'] and life.get('conversation',{}).get('enabled'):
+            raise SetupError('旧停用记忆保留了原文采集选择；请显式配合 --features basic 后启用语义增强，不能随增强恢复采集。')
+        life['enabled'] = True
+        life['friend_dm'] = friend_enabled
+        life.setdefault('explicit_memory', {}).update(enabled=True)
+        life['explicit_memory'].setdefault('ttl_days',30)
+        life.setdefault('agreements', {})['enabled'] = True
+        # Filter old native/cached history even though no conversation body is
+        # collected. Confirmed semantic facts must not resurrect via an agent.
+        extra['local_conversation_context'] = True
+        social.setdefault('dialogue', {}).update(enabled=True,orchestration=True)
+        social.setdefault('learning', {}).update(enabled=True,semantic=True,semantic_auto_trials=True)
     if life['enabled'] and not social['enabled']:
         raise SetupError('life-memory 依赖 social；要恢复社交时显式使用 --enable-social，不能升级时自动恢复。')
     social.setdefault('initiative_mode', 'model' if previous_social is not None else 'local')
     social.setdefault('timezone', 'Asia/Shanghai')
     social.setdefault('quiet_hours', [23, 9])
     social.setdefault('targets', [])
+    if options.get('complete_social'):
+        social['initiative_mode'] = 'model'
+        for name, values in (('dialogue', dict(enabled=True, proactive=True)),
+                             ('activities', dict(enabled=True, proactive=True)),
+                             ('learning', dict(enabled=True, auto_trials=True))):
+            section = social.setdefault(name, {})
+            if not isinstance(section, dict):
+                raise SetupError('已有 '+name+' 必须是社交配置对象。')
+            section.update(values)
     # Fresh installs follow the ACL. An existing explicit test/restricted scope
     # is not permission to expand participation during an ordinary upgrade.
     if options.get('follow_allowed_groups'):
@@ -125,13 +215,34 @@ def build_settings(current, options, home):
         if not set(idle).issubset(groups):
             raise SetupError('空闲联系目标必须属于本次允许群。')
         social['targets'] = ['group:'+g for g in idle]
+    if options.get('idle_friends') is not None:
+        idle_friends = ids(options['idle_friends'], '主动联系好友 idle_friends')
+        if not friend_enabled or not set(idle_friends).issubset(friend_users):
+            raise SetupError('--idle-friends 必须是独立显式好友名单的子集，不能凭群成员资格或全部好友模式授权。')
+        social['targets'] = [chat for chat in social['targets']
+                             if not chat.startswith('dm:') or chat == 'dm:'+owner]
+        social['targets'] += ['dm:'+user for user in idle_friends]
     if options.get('proactive_agreements'):
         if not local or not social['targets']:
             raise SetupError('主动约定需要 --features local-memory 和明确的 --idle-groups。')
         life.setdefault('agreements', {}).update(enabled=True, proactive=True)
     allowed_targets = {'group:'+g for g in groups} | {'dm:'+owner}
-    if not set(social['targets']).issubset(allowed_targets):
+    def friend_target(chat):
+        return (friend_enabled and isinstance(chat, str) and re.fullmatch(r'dm:[1-9][0-9]{0,19}', chat)
+                and chat[3:] not in {owner, account}
+                and (chat[3:] in friend_users or friend and (friend.get('admission') == 'verified_friends'
+                                                           or friend.get('allow_group_members') is True)))
+    if any(chat not in allowed_targets and not friend_target(chat) for chat in social['targets']):
         raise SetupError('已有 idle targets 超出新白名单；请先显式调整这些目标。')
+    if options.get('reading_sources') is not None:
+        sources = reading_sources(options['reading_sources'])
+        observed = set(social['targets']) | {'group:'+g for g in social.get('participation_groups', groups)}
+        if any(chat not in observed or chat not in allowed_targets and not friend_target(chat) for chat in sources):
+            raise SetupError('阅读来源只能绑定已观察的明确群或好友目标；好友需另用 --idle-friends 指定。')
+        section = social.setdefault('activities', {})
+        if not isinstance(section, dict):
+            raise SetupError('已有 activities 必须是社交配置对象。')
+        section['sources'] = sources
     for name in ENABLED:
         entries.setdefault(name, {}).setdefault('settings', {})
     entries['hermes-life-memory']['settings']['memory'] = life
@@ -144,4 +255,4 @@ def build_settings(current, options, home):
                'plugins.enabled': enabled, 'plugins.disabled': disabled}
     worker_policy = dict(schema_version=2, mode='local-only', domain_id=policy['domain_id'],
                          policy_revision=policy['policy_revision'], host_contract=4)
-    return updates, worker, worker_policy, bool(extra.get('local_conversation_context', False))
+    return updates, worker, worker_policy, bool(extra.get('local_conversation_context', False) or shared.get('enabled'))

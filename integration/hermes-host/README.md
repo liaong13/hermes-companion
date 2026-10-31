@@ -4,9 +4,11 @@
 
 QQ／social／life-memory 成套接入现在可使用仓库根目录的 [统一安装入口](../../INSTALL.md)。它会在临时覆盖层组合检查本目录的匹配增量，再备份并应用必要文件；本目录保留独立补丁与实验性 provider 的手动复验说明，不代表任意版本都能直接应用。
 
-默认组合为 `napcat-public-turn`、`napcat-social-participation`、`napcat-ambient-quiet`；启用本地交流上下文时另加 `napcat-local-memory-context`，不自动应用 provider 的 `llm-facade.patch`。当前配套、实际补丁组合测试及运行／客户端验收区别见[安装验收记录](../../docs/安装修复与统一接入验收.md)。
+默认组合为 `napcat-public-turn`、`napcat-social-participation`、`napcat-ambient-quiet`、`napcat-shared-identity`；启用本地交流上下文或显式共享人格时另加 `napcat-local-memory-context`，不自动应用 provider 的 `llm-facade.patch`。共享增量仅声明可信通道可提供 SOUL 与经筛选审核的非敏感日常摘要，默认不启用文件读取；边界见[共享人格与日常记忆](../../plugins/hermes-napcat/docs/共享人格与日常记忆.md)。当前配套、实际补丁组合测试及运行／客户端验收区别见[安装验收记录](../../docs/安装修复与统一接入验收.md)。
 
 补丁基线：`5894e750c3dba980d43b25aa29e3958149ba2c61`。自有补丁采用 MIT；修改目标仍遵循 Hermes 的许可证。其他宿主版本必须重新检查与测试，不能仅凭补丁文件存在或历史测试通过认定兼容。
+
+`--enhance-social` 同样要求 `napcat-local-memory-context`，用于每次重新筛选跨天语义资料。独立的 `verify_napcat_social_live.py --enhanced-social`、`verify_crossday_memory_live.py`、`verify_semantic_methods_live.py` 分别覆盖多人编排、明确记忆和语义方法；均需显式 `--live` 才调用真实模型，使用合成身份及捕获通道，不连接 QQ。运行命令应提供明确的 host、owner-home 和目标插件路径；报告区分初始合成 ACK、实际模型结果与客户端验收。
 
 另有独立的 [NapCat 公共群回合补丁](napcat-public-turn.md)及[源码补丁文件](napcat-public-turn.patch)，用于 `social_agent / contract: 5` 的完整 gateway 回合、工具执行边界与持久化 source 凭证接续。它不是下文记忆 facade 补丁的同义名称，两者不能互相替代；群文本已完成特定部署的用户确认，其他能力的证据边界见对应说明。
 

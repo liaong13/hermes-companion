@@ -34,6 +34,23 @@ class InstallerTests(unittest.TestCase):
         self.options = dict(self_id='90001', owner_id='10001', groups='20001,20002',
                             runtime_home=str(self.root/'worker'))
 
+    def test_shared_persona_and_daily_memory_are_explicit_and_preserved(self):
+        base, *_ = build_settings(self.config, self.options, self.home)
+        self.assertNotIn('shared_identity', base['platforms.napcat']['extra'])
+        for option, expected in (('share_persona', {'enabled':True}),
+                                 ('share_daily_memory', {'enabled':True, 'daily_memory':True})):
+            updates, _, _, local = build_settings(self.config, {**self.options, option:True}, self.home)
+            self.assertTrue(local)  # Shared identity also requires fresh agent/history isolation.
+            self.assertEqual(updates['platforms.napcat']['extra']['shared_identity'], expected)
+            self.assertNotIn('memory', updates)
+            self.assertFalse(updates['plugins.entries']['hermes-life-memory']['settings']['memory']
+                             .get('conversation', {}).get('enabled', False))
+            current = {**self.config, 'platforms':{'napcat':updates['platforms.napcat']}}
+            repeated, *_ = build_settings(current, self.options, self.home)
+            self.assertEqual(repeated['platforms.napcat']['extra']['shared_identity'], expected)
+        args = install.parser().parse_args(['--share-daily-memory'])
+        self.assertTrue(args.share_daily_memory)
+
     def test_basic_install_preserves_private_provider_and_adds_no_idle_grant(self):
         updates, worker, policy, local = build_settings(self.config, self.options, self.home)
         self.assertEqual(self.config['memory']['provider'], 'mem0')
@@ -80,6 +97,170 @@ class InstallerTests(unittest.TestCase):
         config['platforms']['napcat']['extra']['isolation']['guest_dm_users'] = ['10004']
         with self.assertRaises(SetupError):
             build_settings(config, self.options, self.home)
+
+    def configured(self, options=None):
+        first, *_ = build_settings(self.config, {**self.options, **(options or {})}, self.home)
+        return {**deepcopy(self.config), 'platforms': {'napcat': first['platforms.napcat']},
+                'plugins': {'entries': first['plugins.entries']}}
+
+    def test_friend_acl_is_independent_and_upgrade_preserves_legacy_guests(self):
+        config = self.configured({'friend_users': '30001,30002', 'friend_media': True})
+        extra = config['platforms']['napcat']['extra']
+        self.assertEqual(extra['allowed_users'], ['10001'])
+        self.assertEqual(extra['friend_dm'], dict(enabled=True, admission='explicit',
+                                                users=['30001', '30002'], media=True))
+        extra['allowed_users'].append('30003')
+        extra['isolation']['guest_dm_users'] = ['30003']
+        updates, *_ = build_settings(config, {}, self.home)
+        saved = updates['platforms.napcat']['extra']
+        self.assertEqual(saved['friend_dm'], extra['friend_dm'])
+        self.assertEqual(saved['isolation']['guest_dm_users'], ['30003'])
+        self.assertEqual(saved['allowed_users'], ['10001', '30003'])
+        extra.pop('friend_dm')
+        updates, *_ = build_settings(config, {}, self.home)
+        self.assertNotIn('friend_dm', updates['platforms.napcat']['extra'])
+        self.assertEqual(updates['platforms.napcat']['extra']['isolation']['guest_dm_users'], ['30003'])
+
+    def test_friend_flags_never_authorize_owner_self_or_arbitrary_idle_friends(self):
+        for options in ({'friend_users': '10001'}, {'friend_users': '90001'}, {'friend_media': True},
+                        {'idle_friends': '30001'}, {'friend_users': '30001', 'idle_friends': '30002'}):
+            with self.subTest(options=options), self.assertRaises(SetupError):
+                build_settings(self.config, {**self.options, **options}, self.home)
+        config = self.configured()
+        config['platforms']['napcat']['extra']['friend_dm'] = dict(enabled=True, admission='verified_friends')
+        with self.assertRaises(SetupError):
+            build_settings(config, {'idle_friends': '30001'}, self.home)
+
+    def test_explicit_group_member_friend_flag_never_adds_targets_or_private_acl(self):
+        updates, *_ = build_settings(self.config, {**self.options, 'friend_group_members': True}, self.home)
+        extra = updates['platforms.napcat']['extra']
+        self.assertEqual(extra['allowed_users'], ['10001'])
+        self.assertEqual(extra['friend_dm'], dict(enabled=True, allow_group_members=True))
+        self.assertEqual(updates['plugins.entries']['hermes-social']['settings']['channels']['napcat']['targets'], [])
+        with self.assertRaises(SetupError):
+            build_settings(self.config, {**self.options, 'friend_group_members': True, 'idle_friends': '30001'}, self.home)
+
+    def test_idle_friend_targets_preserve_existing_group_owner_and_need_exact_allowlist(self):
+        config = self.configured({'friend_users': '30001,30002'})
+        social = config['plugins']['entries']['hermes-social']['settings']['channels']['napcat']
+        social['targets'] = ['group:20001', 'dm:10001', 'dm:30002']
+        updates, *_ = build_settings(config, {'idle_friends': '30001'}, self.home)
+        result = updates['plugins.entries']['hermes-social']['settings']['channels']['napcat']
+        self.assertEqual(result['targets'], ['group:20001', 'dm:10001', 'dm:30001'])
+        with self.assertRaises(SetupError):
+            build_settings(config, {'friend_users': '30001'}, self.home)
+
+    def test_complete_social_does_not_add_targets_sources_or_raw_chat_memory(self):
+        config = self.configured()
+        config['plugins']['entries']['hermes-social']['settings']['channels']['napcat']['enabled'] = False
+        config['plugins']['disabled'] = ['hermes-social', 'hermes-life-memory']
+        updates, _, _, local = build_settings(config, {'complete_social': True}, self.home)
+        social = updates['plugins.entries']['hermes-social']['settings']['channels']['napcat']
+        self.assertTrue(social['enabled'])
+        self.assertEqual(social['initiative_mode'], 'model')
+        self.assertEqual(social['targets'], [])
+        self.assertNotIn('sources', social['activities'])
+        for name in ('dialogue', 'activities', 'learning'):
+            self.assertTrue(social[name]['enabled'])
+        self.assertTrue(social['dialogue']['proactive'])
+        self.assertTrue(social['activities']['proactive'])
+        self.assertTrue(social['learning']['auto_trials'])
+        self.assertFalse(local)
+        memory = updates['plugins.entries']['hermes-life-memory']['settings']['memory']
+        self.assertFalse(memory['enabled'])
+        self.assertNotIn('conversation', memory)
+
+    def test_enhanced_social_enables_selected_capabilities_without_collection_or_exploration(self):
+        config = self.configured({'friend_users':'30001'})
+        before = deepcopy(config)
+        updates, _, _, filtered_history = build_settings(config, {'enhance_social':True}, self.home)
+        social = updates['plugins.entries']['hermes-social']['settings']['channels']['napcat']
+        memory = updates['plugins.entries']['hermes-life-memory']['settings']['memory']
+        self.assertTrue(social['dialogue']['orchestration'])
+        self.assertTrue(social['learning']['semantic'])
+        self.assertTrue(social['learning']['semantic_auto_trials'])
+        self.assertTrue(memory['explicit_memory']['enabled'])
+        self.assertTrue(memory['friend_dm'])
+        self.assertTrue(memory['agreements']['enabled'])
+        self.assertFalse(memory.get('agreements',{}).get('proactive',False))
+        self.assertFalse(memory.get('conversation',{}).get('enabled',False))
+        self.assertFalse(memory.get('episodes',{}).get('enabled',False))
+        self.assertTrue(filtered_history)
+        self.assertTrue(updates['platforms.napcat']['extra']['local_conversation_context'])
+        self.assertEqual(social['targets'],before['plugins']['entries']['hermes-social']['settings']['channels']['napcat']['targets'])
+        self.assertNotIn('activities',social)
+        self.assertEqual(updates['platforms.napcat']['extra']['friend_dm'],before['platforms']['napcat']['extra']['friend_dm'])
+        self.assertEqual(config,before)
+
+    def test_enhancement_does_not_admit_friends_or_enable_raw_memory_on_an_ordinary_upgrade(self):
+        config = self.configured()
+        updates, *_ = build_settings(config, {'enhance_social':True}, self.home)
+        memory = updates['plugins.entries']['hermes-life-memory']['settings']['memory']
+        self.assertFalse(memory['friend_dm'])
+        config['platforms']['napcat'] = updates['platforms.napcat']
+        config['plugins']['entries'] = updates['plugins.entries']
+        repeated, *_ = build_settings(config, {}, self.home)
+        self.assertEqual(repeated['plugins.entries'],updates['plugins.entries'])
+        self.assertNotIn('friend_dm',updates['platforms.napcat']['extra'])
+
+    def test_enhancement_cannot_restore_disabled_raw_collection_implicitly(self):
+        config = self.configured({'features':'local-memory'})
+        config['plugins']['disabled'] = ['hermes-life-memory','hermes-social']
+        with self.assertRaises(SetupError):
+            build_settings(config, {'enhance_social':True}, self.home)
+        updates, *_ = build_settings(config, {'features':'basic','enhance_social':True}, self.home)
+        memory = updates['plugins.entries']['hermes-life-memory']['settings']['memory']
+        self.assertFalse(memory['conversation']['enabled'])
+        self.assertTrue(memory['explicit_memory']['enabled'])
+
+    def test_reading_mapping_is_exact_replacement_and_cannot_grant_chat_access(self):
+        config = self.configured({'friend_users': '30001', 'idle_friends': '30001'})
+        social = config['plugins']['entries']['hermes-social']['settings']['channels']['napcat']
+        social['activities'] = dict(enabled=True, sources={'group:20001': ['https://old.example.invalid/']})
+        path = self.root/'sources.json'
+        sources = {'group:20002': ['https://example.invalid/article'], 'dm:30001': ['https://example.invalid/read']}
+        path.write_text(json.dumps(sources))
+        updates, *_ = build_settings(config, {'reading_sources': path, 'complete_social': True}, self.home)
+        saved = updates['plugins.entries']['hermes-social']['settings']['channels']['napcat']
+        self.assertEqual(saved['activities']['sources'], sources)
+        self.assertEqual(saved['targets'], ['dm:30001'])
+        for content in ['[]', '{"group:20002":[],"group:20002":["https://example.invalid/"]}',
+                        '{"dm:30002":["https://example.invalid/"]}', '{"group:99999":["https://example.invalid/"]}',
+                        '{"group:20001":["same","same"]}', 'x'*65537]:
+            path.write_text(content)
+            with self.subTest(content=content[:70]), self.assertRaises(SetupError):
+                build_settings(config, {'reading_sources': path}, self.home)
+
+    def test_complete_options_survive_synthetic_install_and_readback(self):
+        plan, args, repo = self.plan_fixture()
+        path = self.root/'sources.json'
+        path.write_text(json.dumps({'dm:30001': ['https://example.invalid/read']}))
+        plan['updates'], *_ = build_settings(self.config, {**self.options, 'friend_users': '30001',
+            'idle_friends': '30001', 'complete_social': True, 'reading_sources': path}, self.home)
+        with patch.object(install, 'helper', side_effect=self.mock_helper), \
+                patch.object(install, 'run', side_effect=self.mock_cli), \
+                patch.object(install, 'interpreter', return_value=Path(sys.executable)):
+            result = install.apply_plan(plan, args, repo)
+        self.assertEqual(result['status'], 'restart_required')
+        saved = json.loads((self.home/'config.yaml').read_text())
+        extra = saved['platforms']['napcat']['extra']
+        self.assertEqual(extra['allowed_users'], ['10001'])
+        self.assertEqual(extra['friend_dm']['users'], ['30001'])
+        self.assertEqual(saved['plugins']['entries']['hermes-social']['settings']['channels']['napcat']['targets'], ['dm:30001'])
+        self.assertNotIn('conversation', saved['plugins']['entries']['hermes-life-memory']['settings']['memory'])
+
+    def test_new_cli_options_have_explicit_chinese_scope_help(self):
+        args = install.parser().parse_args(['--friend-users', '30001', '--friend-media', '--friend-group-members', '--idle-friends', '30001',
+                                           '--complete-social', '--enhance-social', '--reading-sources', 'scoped.json'])
+        self.assertEqual(args.friend_users, '30001')
+        self.assertTrue(args.friend_media)
+        self.assertTrue(args.friend_group_members)
+        self.assertTrue(args.complete_social)
+        self.assertTrue(args.enhance_social)
+        self.assertEqual(args.reading_sources, Path('scoped.json'))
+        help_text = install.parser().format_help()
+        self.assertIn('不加入 allowed_users', help_text)
+        self.assertIn('不增加目标、来源或原始对话记忆', help_text)
 
     def test_upgrade_neither_expands_collection_nor_resumes_disabled_services(self):
         first, *_ = build_settings(self.config, {**self.options, 'features': 'local-memory'}, self.home)
