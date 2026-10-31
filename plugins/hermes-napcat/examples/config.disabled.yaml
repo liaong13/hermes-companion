@@ -1,0 +1,29 @@
+# Review only; never contains credentials. These defaults cannot connect.
+plugins:
+  enabled: []  # after real NapCat acceptance: add hermes-napcat manually
+platforms:
+  napcat:
+    enabled: false
+    extra:
+      ws_url: ws://127.0.0.1:13011
+      self_id: ""
+      owner_id: ""
+      allowed_users: []
+      allowed_groups: []
+      group_admission: allowed_users # 默认旧语义；all_members 必须配 strict 公共合同4
+      require_mention: true
+      typing: false
+      media:
+        enabled: false
+        groups: []               # must be a subset of allowed_groups
+        types: []                # image / file / record; explicit opt-in
+        references: false
+        observe_metadata: false
+        download_policy: allowlist # 默认旧模式；空 hosts 拒绝网络下载
+        download_hosts: []       # 精确小写 HTTPS 域名；显式 public_https 时可删除本字段
+        cloud: []                # image / audio; separate outbound consent
+        allow_derived_text: false # sending extracted content to original chat model
+# Enabling media additionally requires strict isolation and a code-bound bridge v2.
+# Normal factory host_llm contract 4: config.host-test.disabled.yaml / docs/测试部署接线.md
+# Shared exports, Whisper runtime/weights and cloud budgets: docs/媒体实现与验收.md
+# Do not disable or modify the existing qqbot platform before explicit cutover.

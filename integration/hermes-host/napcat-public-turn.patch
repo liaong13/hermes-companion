@@ -1,0 +1,547 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index ee1aedc952..907ba879d2 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1308,6 +1308,27 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+     if safe_worker_enabled():
+         agent._memory_manager = None
+         return
++    if skip_memory and platform == "napcat" and agent._chat_type == "group":
++        # Mirror the owner's configured Mem0 tool definitions without constructing
++        # a memory manager, initializing a backend, or loading private memory files.
++        # The execution authority rejects every Mem0 call before provider dispatch.
++        agent._memory_manager = None
++        from tools.memory_tool import get_builtin_memory_config
++        mem_config = get_builtin_memory_config(_agent_cfg)
++        if mem_config.get("provider") == "mem0":
++            from plugins.memory import load_memory_provider
++            from agent.memory_manager_tools import memory_provider_tools_exposed, normalize_tool_schema
++            if memory_provider_tools_exposed(agent):
++                provider = load_memory_provider("mem0", register_skills=False)
++                if provider is not None and provider.is_available():
++                    existing = set(agent.valid_tool_names)
++                    for raw_schema in provider.get_tool_schemas():
++                        schema = normalize_tool_schema(raw_schema)
++                        if schema and schema["name"] not in existing:
++                            agent.tools.append({"type": "function", "function": schema})
++                            agent.valid_tool_names.add(schema["name"])
++                            existing.add(schema["name"])
++        return
+     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
+     # built-in store so the memory tool never sees store=None.
+     # Flush/background agents can still pass enabled_toolsets=["memory"] so the built-in file store exists
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index 03ede0060d..3436d9ae72 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -301,6 +301,8 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
+ def _skills_prompt(agent: Any) -> str:
+     """Skills index (empty without skills tools).  Focus mode demotes non-coding
+     categories to names-only — never hidden, every name stays visible."""
++    if agent.platform == "napcat" and getattr(agent, "_chat_type", None) == "group":
++        return ""
+     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
+         return ""
+     import model_tools
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index cb58137a2a..21e0f18e14 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -729,6 +729,15 @@ def _dispatch_authorized_once(
+             }
+             block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
+ 
++    # Mandatory authority runs after every argument rewrite and before guardrails,
++    # approval preparation, and the actual handler. Both executor modes meet here.
++    if block_body is None:
++        from agent.tool_authority import check_tool_authority
++        refusal = check_tool_authority(ref.name, ref.args)
++        if refusal is not None:
++            block_body = {"error": refusal}
++            block_error_type = "tool_authorization_denied"
++
+     guardrail_decision = None
+     if block_body is None:
+         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
+@@ -755,7 +764,10 @@ def _dispatch_authorized_once(
+     from tools.connectors.data_use import collect_data_use
+     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
+         try:
+-            return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
++            result = _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
++            from agent.tool_authority import record_authorized_result
++            record_authorized_result(ref.name, result)
++            return result
+         finally:
+             state.data_use = frozenset(data_use)
+ 
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 2867e3e0a5..a9d8ed7857 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -217,7 +217,17 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
+             return None
+         source = event.source
+ 
+-        if not self._is_user_authorized_for_source(source):
++        napcat_group = source.platform.value == "napcat" and source.chat_type == "group"
++        if napcat_group:
++            try:
++                adapter = self._intake_adapter_for(source)
++                admit = getattr(adapter, "admit_group_source", None)
++                source_authorized = callable(admit) and admit(source) is True
++            except Exception:
++                source_authorized = False
++        else:
++            source_authorized = self._is_user_authorized_for_source(source)
++        if not source_authorized:
+             if source.user_id is None:
+                 # No user identity (Telegram service messages, channel forwards, anonymous admin
+                 # posts, sender_chat): can't be paired but may be authorized via a chat allowlist.
+@@ -1264,6 +1274,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
+             return _paused_notice
+ 
+         _quick_key = self._session_key_for_source(source)
++        if source.platform.value == "napcat" and source.chat_type == "group" and event.get_command():
++            return "群内控制命令不可用；请在已验证的主人私聊使用。"
+         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
+         if _reply is not None:
+             return _reply
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index f942316f2b..61dedc7cab 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -675,6 +675,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+         return response, answered
+ 
+     def _approval_notify_sync(self, approval_data: dict) -> None:
++        if self._ctx.source.platform.value == "napcat" and self._ctx.source.chat_type == "group":
++            raise RuntimeError("group_approval_denied")
+         if self._approval_owner is not None:
+             authority, session_id, generation = self._approval_owner
+             authority.check_approval_generation(session_id, generation)
+@@ -994,7 +996,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+             captured = execution_result.get()
+             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
+                       getattr(agent, 'session_completion_tokens', 0) or 0)
+-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
++            from agent.tool_authority import bind_tool_authority
++            adapter = self._runner._delivery_adapter_for(ctx.source)
++            authority_factory = getattr(adapter, "tool_authority_for_source", None)
++            authority = authority_factory(ctx.source) if callable(authority_factory) else None
++            if ctx.source.platform.value == "napcat" and ctx.source.chat_type == "group" and authority is None:
++                raise RuntimeError("group_tool_principal_unavailable")
++            with bind_tool_authority(authority), notification_turn(
++                agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""
++            ):
+                 result = agent.run_conversation(api_message, **kwargs)
+             if captured is not None:
+                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
+@@ -1125,6 +1135,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+         """Platform context + YAML channel_prompts hint + channel_overrides system_prompt (or global
+         ephemeral) + the gateway ephemeral prompt."""
+         ctx = self._ctx
++        if ctx.source.platform.value == "napcat" and ctx.source.chat_type == "group":
++            return (
++                "这是公开 QQ 群会话。只使用本群已核验的输入和公开网络资料；"
++                "不得读取或透露私人文件、私聊、密钥或其他群资料。"
++                "私人请求请引导已验证主人在私聊重新提出。"
++                "群内工具调用须服从执行时授权；拒绝后不要换路径重试。"
++            )
+         from gateway.session_api_turn import api_execution
+         api = api_execution.get()
+         if api is not None:
+diff --git a/gateway/session.py b/gateway/session.py
+index 4547888037..477a1adfdc 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -695,6 +695,8 @@ def build_session_key(
+     session per platform. Groups add the participant id only when ``group_sessions_per_user`` and
+     not in a thread (threads are shared unless ``thread_sessions_per_user``).
+     """
++    if source.platform.value == "napcat" and source.chat_type == "group":
++        group_sessions_per_user = True
+     is_dm = source.chat_type == "dm"
+     chat_id = source.chat_id
+     if is_dm and source.platform == Platform.WHATSAPP:
+diff --git a/gateway/session_context_refs.py b/gateway/session_context_refs.py
+index 4019613327..aec0c31aa2 100644
+--- a/gateway/session_context_refs.py
++++ b/gateway/session_context_refs.py
+@@ -62,6 +62,11 @@ async def turn_references(runner, event, source, session_key, text):
+     execution, and the returned text, the stored user row, is ``text`` with the same attached
+     context, as a typed turn stores it: later turns still read the content. A refused local turn
+     leaves its refusal on ``event`` for the prepare step to answer with."""
++    # Public NapCat group text is untrusted before tool authority is bound.
++    # Keep all @ references literal; nickname text and verified quotes are separate.
++    if (source.platform.value == 'napcat' and source.chat_type == 'group'
++            and getattr(source, '_napcat_public_turn', False)):
++        return text
+     from gateway.session_cli_turn import cli_turn, rebind_api_text
+     api_text = cli_turn(event.message_id).get('api_text')
+     target = text if api_text is None else api_text
+diff --git a/gateway/session_envelope.py b/gateway/session_envelope.py
+index 36292919a2..5ba2d83673 100644
+--- a/gateway/session_envelope.py
++++ b/gateway/session_envelope.py
+@@ -138,7 +138,13 @@ def _validate_native(runner, event, provenance=None, fresh_roles=False):
+         # re-check denied what the inbound filter had just accepted (#139199).
+         delegated = runner._adapter_flag(
+             source.platform, "authorization_is_upstream", runner._adapter_profile_for_source(source))
+-    if not runner._is_user_authorized_for_source(source, allow_adapter_delegation=delegated):
++    if (source.platform.value == 'napcat' and source.chat_type == 'group'
++            and getattr(source, '_napcat_public_turn', False)):
++        # Native preparation freezes source with copy(); durable execution
++        # reconstructs it. Neither copy carries an adapter-issued grant by
++        # itself: resolve only against the receiving adapter's live permit.
++        _napcat_live_source(runner, source)
++    elif not runner._is_user_authorized_for_source(source, allow_adapter_delegation=delegated):
+         _refuse(event, 'permission_denied', 'user_not_authorized')
+     for name in ('channel_prompt', 'channel_context', 'reply_anchor_override'):
+         if getattr(event, name) is not None and not isinstance(getattr(event, name), str):
+@@ -260,6 +266,20 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
+     return payload
+ 
+ 
++def _napcat_live_source(runner, source) -> SessionSource:
++    adapter = runner._intake_adapter_for(source)
++    restore = getattr(adapter, 'restore_group_source', None)
++    if not callable(restore):
++        raise RuntimeStoreError('permission_denied')
++    try:
++        original = restore(source)
++    except ValueError as exc:
++        raise RuntimeStoreError('permission_denied') from exc
++    if not isinstance(original, SessionSource):
++        raise RuntimeStoreError('permission_denied')
++    return original
++
++
+ def restore_native_source(payload, runner=None):
+     """restore_native's source (provenance included) without re-verifying the captured media:
+     admission needs only the route; execution's restore_native still checks every byte."""
+@@ -273,6 +293,10 @@ def restore_native_source(payload, runner=None):
+         runner = runner or callback_runner()
+         if runner is not None:
+             restore_provenance(runner, source, envelope['provenance'])
++    if source.platform.value == 'napcat' and source.chat_type == 'group':
++        if runner is None:
++            raise RuntimeStoreError('permission_denied')
++        source = _napcat_live_source(runner, source)
+     return source
+ 
+ 
+diff --git a/gateway/session_execution.py b/gateway/session_execution.py
+index 3277a93230..ba05628974 100644
+--- a/gateway/session_execution.py
++++ b/gateway/session_execution.py
+@@ -42,6 +42,8 @@ class GatewaySessionAgentMixin:
+     def _skip_context_files(self, platform_key) -> bool:
+         """gateway.platforms.<plat>.skip_context_files: messaging platforms may opt out of
+         filesystem-heavy context-file discovery (SOUL.md, AGENTS.md, .cursorrules)."""
++        if self._ctx.source.platform.value == "napcat" and self._ctx.source.chat_type == "group":
++            return True
+         from gateway.session_policy import policy_for_source
+         policy = policy_for_source(self._runner, self._ctx.source)
+         if policy:
+@@ -158,13 +160,15 @@ class GatewaySessionAgentMixin:
+         from gateway.session_policy import policy_for_source
+         from gateway.session_worker_construct import session_prefill
+         policy = policy_for_source(runner, src)
++        public_turn = src.platform.value == "napcat" and src.chat_type == "group"
+         return ctx.AIAgent(
+             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
+             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
+             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
+             ephemeral_system_prompt=combined_ephemeral or None,
+-            prefill_messages=(session_prefill(active_authority(runner), policy, src.chat_id) if policy
+-                              else runner._prefill_messages) or None,
++            prefill_messages=(None if public_turn else
++                              (session_prefill(active_authority(runner), policy, src.chat_id) if policy
++                               else runner._prefill_messages) or None),
+             reasoning_config=reasoning_config, service_tier=runner._service_tier,
+             request_overrides=turn_route.get("request_overrides"),
+             providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
+@@ -180,8 +184,8 @@ class GatewaySessionAgentMixin:
+             fallback_model=None if api_runtime_locked() else self._runner._refresh_fallback_model(),
+             skip_context_files=skip_context_files,
+             # Keep the persona even with minimal context: soul identity is one small file.
+-            load_soul_identity=not bool(policy and policy.ignore_rules),
+-            skip_memory=bool(policy and policy.ignore_rules),
++            load_soul_identity=not (public_turn or bool(policy and policy.ignore_rules)),
++            skip_memory=public_turn or bool(policy and policy.ignore_rules),
+             pass_session_id=bool(policy and policy.pass_session_id),
+             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
+             # None leaves the agent reading the owner's config, as before.
+diff --git a/gateway/session_identity.py b/gateway/session_identity.py
+index 618eb6e162..b31b1e8c5b 100644
+--- a/gateway/session_identity.py
++++ b/gateway/session_identity.py
+@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
+ 
+ _IDENTITY_ATTR = "_identity"
+ # Wire-invisible provenance copied alongside the identity when a source is duplicated.
+-_PROVENANCE_ATTRS = ("_transport_adapter_ref", "_authorization_profile_home", _IDENTITY_ATTR)
++_PROVENANCE_ATTRS = ("_transport_adapter_ref", "_authorization_profile_home", _IDENTITY_ATTR,
++                     "_napcat_public_turn")
+ 
+ 
+ class IdentityUnresolved(RuntimeError):
+diff --git a/model_tools.py b/model_tools.py
+index 2462d39656..94f9dc1afe 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -815,6 +815,10 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
+         dispatch_kwargs["user_task"] = user_task
+ 
+     def _dispatch(next_args: dict[str, Any]) -> Any:
++        from agent.tool_authority import check_tool_authority
++        refusal = check_tool_authority(function_name, next_args)
++        if refusal is not None:
++            return tool_error(refusal)
+         from tools.connectors import dispatch_connector_call, is_connector_name
+         if is_connector_name(function_name):
+             return dispatch_connector_call(function_name, next_args, ids.tool_call_id, ids.turn_id, ids.task_id)
+@@ -885,6 +889,12 @@ def handle_function_call(
+     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
+     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
+     # approval, guardrails) sees the real tool name, never the bridge.
++    if function_name == "tool_call":
++        from agent.tool_authority import check_tool_authority
++        refusal = check_tool_authority(function_name, function_args)
++        if refusal is not None:
++            return _emit(tool_error(refusal), status="blocked",
++                         error_type="tool_authorization_denied", error_message=refusal)
+     bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, ids)
+     if bridged is not None:
+         result, underlying = bridged
+@@ -925,6 +935,15 @@ def handle_function_call(
+             result, error_type, error_message = blocked
+             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
+ 
++        # Nested RPC and direct registry callers do not traverse AIAgent's executor.
++        # Recheck the final arguments here; a missing inherited principal is denied
++        # by the group authority at the outer execute_code/delegation boundary.
++        from agent.tool_authority import check_tool_authority
++        refusal = check_tool_authority(function_name, function_args)
++        if refusal is not None:
++            return _emit(tool_error(refusal), status="blocked",
++                         error_type="tool_authorization_denied", error_message=refusal)
++
+         # Any non-read/search tool resets the consecutive-read-loop counter.
+         if function_name not in _READ_SEARCH_TOOLS:
+             try:
+diff --git a/agent/tool_authority.py b/agent/tool_authority.py
+new file mode 100644
+index 0000000000..06089f5d3b
+--- /dev/null
++++ b/agent/tool_authority.py
+@@ -0,0 +1,38 @@
++"""Mandatory, turn-scoped authorization at actual tool dispatch boundaries."""
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++_authority = ContextVar("hermes_tool_authority", default=None)
++
++
++@contextmanager
++def bind_tool_authority(authority):
++    token = _authority.set(authority)
++    try:
++        yield
++    finally:
++        _authority.reset(token)
++
++
++def check_tool_authority(name, arguments):
++    """Return a safe refusal, or None. An authority error always refuses execution."""
++    authority = _authority.get()
++    if authority is None:
++        return None
++    try:
++        decision = authority(name, arguments)
++        if decision is None:
++            return None
++        return str(decision) if decision else "tool_authorization_denied"
++    except Exception:
++        return "tool_authorization_unavailable"
++
++
++def record_authorized_result(name, result):
++    authority = _authority.get()
++    recorder = getattr(authority, "record_result", None)
++    if recorder is not None:
++        try:
++            recorder(name, result)
++        except Exception:
++            pass  # An output receipt cannot expand authority on failure.
+diff --git a/tests/agent/test_tool_authority.py b/tests/agent/test_tool_authority.py
+new file mode 100644
+index 0000000000..be06fc1dbd
+--- /dev/null
++++ b/tests/agent/test_tool_authority.py
+@@ -0,0 +1,85 @@
++"""A turn authority is enforced at the registry dispatch, including direct callers."""
++from unittest.mock import patch
++from types import SimpleNamespace
++
++from agent.tool_authority import bind_tool_authority
++from agent import tool_executor
++import model_tools
++from agent.agent_init import _init_memory
++
++
++def test_direct_dispatch_refuses_before_handler():
++    with patch.object(model_tools, "_pre_dispatch_guards", side_effect=lambda name, args, *rest: (args, None)), \
++         patch.object(model_tools, "_execute_tool", return_value='{"secret":"leak"}') as execute:
++        with bind_tool_authority(lambda name, args: "denied"):
++            result = model_tools.handle_function_call(
++                "web_search", {"query": "private"}, skip_pre_tool_call_hook=True,
++                skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
++            )
++    assert "denied" in result
++    execute.assert_not_called()
++
++
++def test_authority_exception_refuses_before_handler():
++    def broken(name, args):
++        raise RuntimeError("sensitive detail")
++
++    with patch.object(model_tools, "_pre_dispatch_guards", side_effect=lambda name, args, *rest: (args, None)), \
++         patch.object(model_tools, "_execute_tool") as execute:
++        with bind_tool_authority(broken):
++            result = model_tools.handle_function_call(
++                "web_extract", {"urls": ["https://example.org"]},
++                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
++                skip_tool_execution_middleware=True,
++            )
++    assert "tool_authorization_unavailable" in result
++    assert "sensitive detail" not in result
++    execute.assert_not_called()
++
++
++def test_agent_dispatch_refuses_rewritten_arguments():
++    state = tool_executor._ManagedToolResult(None, {}, [], False, False)
++    ref = tool_executor._ToolCallRef('terminal', {'command': 'safe'}, 'task', 'call', [])
++    with patch.object(tool_executor, '_pre_tool_block', return_value=(None, {'command': 'private'})), \
++         patch.object(tool_executor, '_emit_terminal_post_tool_call'):
++        with bind_tool_authority(lambda name, args: 'denied' if args['command'] == 'private' else None):
++            result = tool_executor._dispatch_authorized_once(
++                object(), state, ref, execute=lambda args: (_ for _ in ()).throw(AssertionError('executed')),
++                scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
++            )
++    assert state.blocked
++    assert 'denied' in result
++
++
++def test_direct_middleware_rewrite_is_rechecked():
++    ids = model_tools._CallIds('task', 'session', 'call', 'turn', 'request')
++    def rewrite(name, args, dispatch, **kwargs):
++        return dispatch({'command': 'private'})
++
++    with patch('hermes_cli.middleware.run_tool_execution_middleware', side_effect=rewrite), \
++         patch.object(model_tools.registry, 'dispatch') as dispatch:
++        with bind_tool_authority(lambda name, args: 'denied' if args['command'] == 'private' else None):
++            result = model_tools._execute_tool('terminal', {'command': 'safe'},
++                                               {'command': 'safe'}, ids, user_task=None,
++                                               enabled_tools=None, skip_tool_execution_middleware=False)
++    assert 'denied' in result
++    dispatch.assert_not_called()
++
++
++def test_group_keeps_memory_schema_without_loading_private_store():
++    agent = SimpleNamespace(enabled_toolsets=['memory'], disabled_toolsets=[], _chat_type='group',
++                            tools=[{'type': 'function', 'function': {'name': 'memory'}}],
++                            valid_tool_names={'memory'})
++    with patch('agent.safe_worker_policy.safe_worker_enabled', return_value=False), \
++         patch('tools.memory_tool.MemoryStore.load_from_disk') as load, \
++         patch('tools.memory_tool.get_builtin_memory_config', return_value={'provider': 'mem0'}), \
++         patch('plugins.memory.load_memory_provider') as provider_load:
++        provider_load.return_value.is_available.return_value = True
++        provider_load.return_value.get_tool_schemas.return_value = [
++            {'name': 'mem0_search', 'description': 'search', 'parameters': {'type': 'object'}}]
++        _init_memory(agent, {}, True, 'napcat')
++    assert agent._memory_store is None
++    assert agent._memory_manager is None
++    assert 'mem0_search' in agent.valid_tool_names
++    provider_load.assert_called_once_with('mem0', register_skills=False)
++    load.assert_not_called()
+diff --git a/tests/gateway/test_napcat_public_admission.py b/tests/gateway/test_napcat_public_admission.py
+new file mode 100644
+index 0000000000..fb0132f8ae
+--- /dev/null
++++ b/tests/gateway/test_napcat_public_admission.py
+@@ -0,0 +1,73 @@
++"""A NapCat group reaches the runner only with its live adapter admission."""
++import asyncio
++import sys
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from gateway.run_inbound import GatewayInboundMixin
++from gateway.run_turn_runner import TurnRunner
++from gateway.session_context_refs import turn_references
++
++
++class _Runner(GatewayInboundMixin):
++    config = SimpleNamespace(multiplex_profiles=False)
++
++    def __init__(self, adapter):
++        self.adapter = adapter
++
++    def _scale_to_zero_note_real_inbound(self):
++        pass
++
++    async def _hm_pre_gateway_dispatch_hook(self, event, source):
++        return event
++
++    def _intake_adapter_for(self, source):
++        return self.adapter
++
++    def _is_user_authorized_for_source(self, source):
++        raise AssertionError('profile allowlist cannot replace the NapCat receipt')
++
++    def _admit_bot_message_for_source(self, source):
++        return True
++
++
++def test_live_adapter_receipt_required():
++    source = SimpleNamespace(platform=SimpleNamespace(value='napcat'), chat_type='group',
++                             chat_id='group:20001', user_id='10001', user_name='member',
++                             profile=None, profile_route_rejected=False)
++    event = SimpleNamespace(source=source, internal=False, _fifo_only=False,
++                            _bot_loop_admitted=False)
++    adapter = SimpleNamespace(admit_group_source=lambda src: src is source)
++    runner = _Runner(adapter)
++    with patch.dict(sys.modules, {'gateway.run': SimpleNamespace(_is_slack_ignored_channel=lambda *a: False)}):
++        assert asyncio.run(runner._hm_admit_event(event)) == (event, source, False)
++        adapter.admit_group_source = lambda src: False
++        assert asyncio.run(runner._hm_admit_event(event)) is None
++        adapter.admit_group_source = lambda src: (_ for _ in ()).throw(RuntimeError('bad'))
++        assert asyncio.run(runner._hm_admit_event(event)) is None
++
++
++def test_group_approval_never_renders():
++    runner = object.__new__(TurnRunner)
++    runner._ctx = SimpleNamespace(source=SimpleNamespace(
++        platform=SimpleNamespace(value='napcat'), chat_type='group'))
++    with patch.object(TurnRunner, '_render_approval_sync') as render:
++        with pytest.raises(RuntimeError, match='group_approval_denied'):
++            runner._approval_notify_sync({'command': 'private'})
++    render.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_public_group_keeps_local_and_plugin_references_literal(tmp_path):
++    private = tmp_path / 'private.txt'
++    private.write_text('PRIVATE_CANARY')
++    source = SimpleNamespace(platform=SimpleNamespace(value='napcat'), chat_type='group',
++                             _napcat_public_turn=True)
++    event = SimpleNamespace(message_id='7')
++    message = f'@小明 请看 @file:{private} @folder:{tmp_path} @git:HEAD @plugin:secret'
++    with patch('gateway.session_context_refs.inbound_references', side_effect=AssertionError('expanded')):
++        result = await turn_references(object(), event, source, 'group:7', message)
++    assert result == message
++    assert 'PRIVATE_CANARY' not in result

@@ -1,0 +1,15 @@
+name: hermes-napcat
+label: Hermes NapCat
+kind: platform
+version: 0.5.0
+description: Fail-closed OneBot 11 forward WebSocket adapter; no model tools.
+author: Hermes NapCat contributors
+license: MIT
+requires_env:
+  - name: NAPCAT_ACCESS_TOKEN
+    description: NapCat forward WebSocket Bearer credential
+    password: true
+optional_env:
+  - name: OPENROUTER_API_KEY
+    description: Standard OpenRouter key for explicitly enabled auxiliary image recognition; takes precedence over the legacy NAPCAT_MEDIA_OPENROUTER_API_KEY, including when empty
+    password: true

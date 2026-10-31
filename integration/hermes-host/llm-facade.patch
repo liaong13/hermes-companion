@@ -1,0 +1,437 @@
+diff --git a/hermes_cli/plugins_llm_binding.py b/hermes_cli/plugins_llm_binding.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/plugins_llm_binding.py
+@@ -0,0 +1,66 @@
++"""Profile-bound plugin LLM access for providers and persistent background work."""
++from __future__ import annotations
++
++from threading import Event
++from typing import Any
++
++from hermes_constants import hermes_home_key
++
++
++class BoundPluginLlm:
++    """A host capability revoked on unload, never a credential or context snapshot.
++
++    The owning manager supplies the profile. An ambient profile mismatch is an
++    error rather than a reason to borrow another profile's model configuration.
++    Task ownership is checked against the live registry on every call, so a
++    swallowed registration failure cannot silently select a built-in task.
++    """
++
++    def __init__(self, context: Any):
++        self._context = context
++        self._home = context._manager.scope_key
++        self._closed = Event()
++        context.on_unload(self._closed.set)
++
++    def binding(self, *, task: str | None = None) -> dict[str, Any]:
++        if self._closed.is_set() or self._context._load_abandoned:
++            raise PermissionError("plugin LLM binding has been revoked")
++        if hermes_home_key() != self._home:
++            raise PermissionError("plugin LLM profile mismatch")
++        if task is not None and (not isinstance(task, str) or not task):
++            raise ValueError("task must be a nonempty string or None")
++        manager = self._context._manager
++        with manager._discovery_lock:
++            entry = manager._aux_tasks.get(task) if task else None
++            registered = entry is not None and entry.get("plugin") == self._context.plugin_id
++        return {"contract_version": 1, "plugin_id": self._context.plugin_id,
++                "profile_home": self._home, "task": task, "task_registered": registered}
++
++    def _check(self, task: str | None) -> None:
++        binding = self.binding(task=task)
++        if task is not None and not binding["task_registered"]:
++            raise PermissionError("plugin LLM auxiliary task is not registered by this plugin")
++
++    def _complete(self, method: str, args: tuple, kwargs: dict) -> Any:
++        self._check(kwargs.get("task"))
++        result = getattr(self._context.llm, method)(*args, **kwargs)
++        self._check(kwargs.get("task"))
++        return result
++
++    async def _acomplete(self, method: str, args: tuple, kwargs: dict) -> Any:
++        self._check(kwargs.get("task"))
++        result = await getattr(self._context.llm, method)(*args, **kwargs)
++        self._check(kwargs.get("task"))
++        return result
++
++    def complete(self, *args: Any, **kwargs: Any) -> Any:
++        return self._complete("complete", args, kwargs)
++
++    def complete_structured(self, *args: Any, **kwargs: Any) -> Any:
++        return self._complete("complete_structured", args, kwargs)
++
++    async def acomplete(self, *args: Any, **kwargs: Any) -> Any:
++        return await self._acomplete("acomplete", args, kwargs)
++
++    async def acomplete_structured(self, *args: Any, **kwargs: Any) -> Any:
++        return await self._acomplete("acomplete_structured", args, kwargs)
+diff --git a/hermes_cli/plugins_session_binding.py b/hermes_cli/plugins_session_binding.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/plugins_session_binding.py
+@@ -0,0 +1,44 @@
++"""Read-only parent-process session identity for native and hosted plugins."""
++from __future__ import annotations
++
++from threading import Event
++from typing import Any
++
++from hermes_constants import hermes_home_key
++
++
++class BoundPluginSession:
++    """Resolve the live caller every time, never retain an identity snapshot.
++
++    Hosted callbacks run under the original parent RPC caller context. Detached
++    child work instead reaches PluginHost's empty base context and receives empty
++    fields. Reading ContextVars directly deliberately excludes get_session_env's
++    process-environment fallback.
++    """
++
++    def __init__(self, context: Any):
++        self._context = context
++        self._home = context._manager.scope_key
++        self._closed = Event()
++        context.on_unload(self._closed.set)
++
++    def binding(self) -> dict[str, Any]:
++        if self._closed.is_set() or self._context._load_abandoned:
++            raise PermissionError("plugin session binding has been revoked")
++        if hermes_home_key() != self._home:
++            raise PermissionError("plugin session profile mismatch")
++        return {"contract_version": 1, "plugin_id": self._context.plugin_id,
++                "profile_home": self._home}
++
++    def snapshot(self) -> dict[str, str]:
++        self.binding()
++        from gateway import session_context as ctx
++
++        fields = ("platform", "chat_id", "chat_type", "user_id", "thread_id", "session_id", "message_id")
++        result = {}
++        for field in fields:
++            name = "_SESSION_ID" if field == "session_id" else "_SESSION_" + field.upper()
++            value = getattr(ctx, name).get()
++            result[field] = "" if value is ctx._UNSET else str(value or "")
++        self.binding()
++        return result
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -383,6 +383,22 @@
+         return self._llm
+ 
+     @cached_property
++    def bound_llm(self) -> Any:
++        """Profile-bound LLM facade with live task ownership and unload revocation.
++
++        ``binding(task=...)`` returns serializable attribution for a provider to
++        compare with its initialize-time home before starting background work.
++        """
++        from hermes_cli.plugins_llm_binding import BoundPluginLlm
++        return BoundPluginLlm(self)
++
++    @cached_property
++    def bound_session(self) -> Any:
++        """Read-only live caller identity without process-environment fallback."""
++        from hermes_cli.plugins_session_binding import BoundPluginSession
++        return BoundPluginSession(self)
++
++    @cached_property
+     def subagent_lifecycle(self) -> Any:
+         """Plugin-safe subagent lifecycle service: serializable handles and immutable snapshots,
+         never a live agent or private registry."""
+diff --git a/plugins/memory/__init__.py b/plugins/memory/__init__.py
+--- a/plugins/memory/__init__.py
++++ b/plugins/memory/__init__.py
+@@ -445,6 +445,21 @@
+     def register_memory_provider(self, provider):
+         self.provider = provider
+ 
++    @property
++    def llm(self):
++        """The same host-owned facade provided to ordinary plugins."""
++        return self._plugin_context().llm
++
++    @property
++    def bound_llm(self):
++        """Persistent providers use the explicit profile/task/lifecycle contract."""
++        return self._plugin_context().bound_llm
++
++    @property
++    def bound_session(self):
++        """Hosted providers resolve live identity in the caller's parent context."""
++        return self._plugin_context().bound_session
++
+     def register_skill(self, *args, **kwargs):
+         """Forward skills to the plugin registry, tracking qualified name + path so
+         switching the active provider can retract the previous one's skills. Gated
+diff --git a/hermes_cli/plugin_isolation.py b/hermes_cli/plugin_isolation.py
+--- a/hermes_cli/plugin_isolation.py
++++ b/hermes_cli/plugin_isolation.py
+@@ -51,7 +51,7 @@
+ 
+ # Live ctx facades the host reaches by method call; each call returns plain data.
+ HOST_REMOTE_FACADES: frozenset[str] = frozenset({
+-    "state", "llm", "platform_actions", "subagent_lifecycle", "delegation_backends",
++    "state", "llm", "bound_llm", "bound_session", "platform_actions", "subagent_lifecycle", "delegation_backends",
+ })
+ 
+ # Object-taking ctx methods and the ABC the parent checks. The host sends the object's method table
+diff --git a/website/docs/developer-guide/memory-provider-plugin.md b/website/docs/developer-guide/memory-provider-plugin.md
+--- a/website/docs/developer-guide/memory-provider-plugin.md
++++ b/website/docs/developer-guide/memory-provider-plugin.md
+@@ -85,6 +85,38 @@
+ entry point at a package rather than a single module if you ship either.
+ 
+ ## The MemoryProvider ABC
++
++### Host-owned LLM access
++
++The provider registration context exposes `ctx.llm` just like ordinary plugins,
++including when the provider runs in the plugin host subprocess. Persistent
++providers should retain `ctx.bound_llm` instead: this facade rejects another
++profile's ambient home, checks live auxiliary-task ownership on every call and
++is revoked on plugin unload. It supports the same four completion methods.
++
++After `ctx.register_auxiliary_task(...)`, call
++`ctx.bound_llm.binding(task="your_task")`. Its serializable result contains
++`contract_version=1`, `plugin_id`, `profile_home`, `task` and `task_registered`.
++Compare `profile_home` with the `hermes_home` passed to `initialize`, require the
++expected plugin ID and `task_registered is True`, and repeat the check before
++background extraction. A registration method returning without an exception is
++not proof that the task registered: secondary provider registrations may fail
++without costing the memory provider itself. These metadata never contain keys.
++
++The facade is an instance-local runtime capability; do not serialize it into a
++database or share it through a process-global singleton. Reacquire it through
++`register` after restart. This contract does not grant filesystem isolation,
++gateway admission, or permission to send private conversation text to a model.
++
++Providers that resolve gateway identity use `ctx.bound_session.snapshot()` rather
++than reading child-process ContextVars. It reads the parent caller's live
++`platform`, `chat_id`, `chat_type`, `user_id`, `thread_id`, `session_id`, and
++`message_id` as strings. Unset values are empty, with no environment fallback.
++`binding()` returns `contract_version=1`, `plugin_id`, and `profile_home`; verify
++these at initialization. This facade has the same profile and unload boundaries
++as `bound_llm`. It never caches identity or accepts user/model identity fields.
++Detached hosted work has no active caller and gets empty fields; durable jobs
++must use their persisted, re-authorized scope rather than a previous snapshot.
+ 
+ Your plugin implements the `MemoryProvider` abstract base class from `agent/memory_provider.py`:
+ 
+diff --git a/tests/hermes_cli/test_memory_bound_llm.py b/tests/hermes_cli/test_memory_bound_llm.py
+new file mode 100644
+--- /dev/null
++++ b/tests/hermes_cli/test_memory_bound_llm.py
+@@ -0,0 +1,207 @@
++"""Provider-only discovery reaches the real profile-bound facade, also across RPC."""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import time
++from concurrent.futures import ThreadPoolExecutor
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
++from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
++
++
++BODY = '''
++import json, os, threading
++from agent.memory_provider import MemoryProvider
++
++class Probe(MemoryProvider):
++    @property
++    def name(self): return "boundprobe"
++    def is_available(self): return True
++    def initialize(self, session_id, **kwargs): pass
++    def get_tool_schemas(self): return []
++    def terminate_for_test(self): os._exit(3)
++    def read_session(self): return json.dumps(self.reader.snapshot())
++    def detached_session(self):
++        results = []
++        worker = threading.Thread(target=lambda: results.append(self.reader.snapshot()))
++        worker.start()
++        worker.join(timeout=5)
++        if worker.is_alive(): raise RuntimeError("detached probe timed out")
++        return json.dumps(results[0])
++    def prefetch(self, query, **kwargs):
++        binding = self.service.binding(task="boundprobe_extract")
++        reply = self.service.complete_structured(instructions="synthetic", input=[], task="boundprobe_extract")
++        return json.dumps({"binding": binding, "reply": reply, "provider_pid": os.getpid()})
++
++def register(ctx):
++    ctx.register_auxiliary_task("boundprobe_extract", display_name="Probe", description="synthetic")
++    provider = Probe()
++    provider.service = ctx.bound_llm
++    provider.reader = ctx.bound_session
++    ctx.register_memory_provider(provider)
++'''
++
++
++def context(home):
++    manager = PluginManager(scope_key=str(home))
++    ctx = PluginContext(PluginManifest(name="boundprobe", key="boundprobe"), manager)
++    ctx.register_auxiliary_task("boundprobe_extract", display_name="Probe", description="synthetic")
++    return ctx, manager
++
++
++def test_binding_rejects_wrong_profile_unregistered_task_and_unloaded_context(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    ctx, manager = context(tmp_path)
++    service = ctx.bound_llm
++    reader = ctx.bound_session
++    binding = service.binding(task="boundprobe_extract")
++    assert binding == {"contract_version": 1, "plugin_id": "boundprobe", "profile_home": hermes_home_key(tmp_path),
++                       "task": "boundprobe_extract", "task_registered": True}
++    assert reader.binding() == {"contract_version": 1, "plugin_id": "boundprobe", "profile_home": hermes_home_key(tmp_path)}
++    assert service.binding(task="missing")["task_registered"] is False
++    ctx._llm = SimpleNamespace(complete=lambda **kw: pytest.fail("must not call model"))
++    with pytest.raises(PermissionError):
++        service.complete(task="missing")
++    manager._aux_tasks["boundprobe_extract"]["plugin"] = "another-plugin"
++    assert service.binding(task="boundprobe_extract")["task_registered"] is False
++    with pytest.raises(PermissionError):
++        service.complete(task="boundprobe_extract")
++    token = set_hermes_home_override(tmp_path / "other-profile")
++    try:
++        with pytest.raises(PermissionError):
++            service.binding(task="boundprobe_extract")
++        with pytest.raises(PermissionError):
++            reader.snapshot()
++    finally:
++        reset_hermes_home_override(token)
++    manager.unload("boundprobe")
++    with pytest.raises(PermissionError):
++        service.binding(task="boundprobe_extract")
++    with pytest.raises(PermissionError):
++        reader.snapshot()
++
++
++def test_sync_and_async_results_are_rejected_when_binding_revoked_during_call(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    ctx, manager = context(tmp_path)
++    service = ctx.bound_llm
++    async def revoke_async(**kwargs):
++        manager.unload("boundprobe")
++        return "late result"
++    ctx._llm = SimpleNamespace(acomplete_structured=revoke_async)
++    with pytest.raises(PermissionError):
++        asyncio.run(service.acomplete_structured(task="boundprobe_extract"))
++    ctx, manager = context(tmp_path)
++    service = ctx.bound_llm
++    def revoke_sync(**kwargs):
++        manager.unload("boundprobe")
++        return "late result"
++    ctx._llm = SimpleNamespace(complete=revoke_sync)
++    with pytest.raises(PermissionError):
++        service.complete(task="boundprobe_extract")
++
++
++@pytest.mark.parametrize("isolation", ["in_process", "host"])
++@pytest.mark.parametrize("general_first", [False, True])
++def test_provider_only_discovery_binds_actual_task_home_and_facade_over_rpc(tmp_path, monkeypatch, isolation, general_first):
++    from agent.plugin_llm import PluginLlm
++    from hermes_cli import plugins as plugins_mod
++    from plugins.memory import load_memory_provider
++
++    home = tmp_path / "profile"
++    plugin = home / "plugins" / "boundprobe"
++    plugin.mkdir(parents=True)
++    (plugin / "plugin.yaml").write_text("name: boundprobe\nversion: 1.0\nkind: standalone\n", encoding="utf-8")
++    (plugin / "__init__.py").write_text(BODY, encoding="utf-8")
++    (home / "config.yaml").write_text("plugins:\n  isolation: " + isolation + "\n  enabled: [boundprobe]\n", encoding="utf-8")
++    monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    bundled = tmp_path / "bundled"
++    bundled.mkdir()
++    monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
++    calls = []
++    def fake_call(self, **kwargs):
++        calls.append(kwargs)
++        return {"parsed": {"synthetic": True}, "home": hermes_home_key()}
++    monkeypatch.setattr(PluginLlm, "complete_structured", fake_call)
++    if general_first:
++        manager = plugins_mod.get_plugin_manager()
++        manager.discover_and_load()
++        assert manager._plugins["boundprobe"].enabled is True
++    provider = load_memory_provider("boundprobe")
++    assert provider is not None
++    try:
++        result = json.loads(provider.prefetch("synthetic"))
++        assert result["binding"]["task_registered"] is True
++        assert result["binding"]["profile_home"] == hermes_home_key(home)
++        assert result["binding"]["plugin_id"] == "boundprobe"
++        assert result["reply"] == {"parsed": {"synthetic": True}, "home": hermes_home_key(home)}
++        assert (result["provider_pid"] == os.getpid()) == (isolation == "in_process")
++        assert calls == [{"instructions": "synthetic", "input": [], "task": "boundprobe_extract"}]
++        if isolation == "host":
++            host = plugins_mod.get_plugin_manager()._plugin_host()
++            with pytest.raises(Exception):
++                provider.terminate_for_test()
++            deadline = time.monotonic() + 5
++            while host.alive and time.monotonic() < deadline:
++                time.sleep(0.01)
++            reloaded = json.loads(provider.prefetch("synthetic after restart"))
++            assert reloaded["provider_pid"] not in {result["provider_pid"], os.getpid()}
++            assert reloaded["binding"] == result["binding"]
++    finally:
++        manager = plugins_mod.get_plugin_manager()
++        manager.unload()
++        if isolation == "host":
++            manager._plugin_host().shutdown()
++
++
++@pytest.mark.parametrize("isolation", ["in_process", "host"])
++def test_live_session_identity_is_task_local_environment_free_and_absent_for_detached_work(tmp_path, monkeypatch, isolation):
++    from gateway import session_context as sc
++    from hermes_cli import plugins as plugins_mod
++    from plugins.memory import load_memory_provider
++
++    home = tmp_path / "profile"
++    plugin = home / "plugins" / "boundprobe"
++    plugin.mkdir(parents=True)
++    (plugin / "__init__.py").write_text(BODY, encoding="utf-8")
++    (plugin / "plugin.yaml").write_text("name: boundprobe\nversion: 1.0\n", encoding="utf-8")
++    (home / "config.yaml").write_text("plugins:\n  isolation: " + isolation + "\n", encoding="utf-8")
++    monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "napcat")
++    monkeypatch.setenv("HERMES_SESSION_USER_ID", "forged-owner")
++    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "dm:forged-owner")
++    provider = load_memory_provider("boundprobe")
++    assert provider is not None
++    fields = ("platform", "chat_id", "chat_type", "user_id", "thread_id", "session_id", "message_id")
++    empty = dict.fromkeys(fields, "")
++    def read(number):
++        expected = dict(platform="napcat", user_id=str(20000+number), chat_id="group:"+str(900+number),
++                        chat_type="group", thread_id="thread-"+str(number),
++                        session_id="session-"+str(number), message_id="message-"+str(number))
++        home_token = set_hermes_home_override(home)
++        tokens = sc.set_session_vars(**expected)
++        try:
++            assert json.loads(provider.read_session()) == expected
++            assert json.loads(provider.detached_session()) == empty
++            return expected["user_id"]
++        finally:
++            for token in reversed(tokens):
++                token.var.reset(token)
++            reset_hermes_home_override(home_token)
++    try:
++        assert json.loads(provider.read_session()) == empty
++        with ThreadPoolExecutor(max_workers=4) as executor:
++            assert list(executor.map(read, range(8))) == [str(20000+number) for number in range(8)]
++        assert json.loads(provider.read_session()) == empty
++    finally:
++        manager = plugins_mod.get_plugin_manager()
++        manager.unload()
++        if isolation == "host":
++            manager._plugin_host().shutdown()

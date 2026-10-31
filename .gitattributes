@@ -1,0 +1,2 @@
+# Unified diff 的空白上下文行需要保留一个空格，不能按源码尾随空白清理。
+integration/hermes-host/*.patch whitespace=-blank-at-eol

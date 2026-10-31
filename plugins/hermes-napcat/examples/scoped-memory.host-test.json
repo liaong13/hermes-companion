@@ -1,0 +1,7 @@
+{
+  "schema_version": 2,
+  "mode": "local-only",
+  "domain_id": "napcat-public",
+  "policy_revision": 2,
+  "host_contract": 4
+}

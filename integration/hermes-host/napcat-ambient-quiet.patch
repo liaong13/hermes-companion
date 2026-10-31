@@ -1,0 +1,54 @@
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -2323,9 +2323,11 @@
+         from run_agent import AIAgent
+ 
+         disp = self._run_agent_display_settings(source)
+-        if scheduled_heartbeat:
+-            # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
+-            # liveness notices would create a user-visible ping before its final result is known.
++        quiet_optional_reply = (str(getattr(source.platform, "value", source.platform)) == "napcat"
++                                and reply_expected is False)
++        if scheduled_heartbeat or quiet_optional_reply:
++            # Heartbeats and opt-in unaddressed NapCat candidates may stay silent:
++            # tool chrome/drafts must not ping before their final decision is known.
+             # Keep status callbacks intact for approvals and actionable failures.
+             disp = dataclasses.replace(
+                 disp,
+@@ -2352,8 +2354,8 @@
+         _status_thread_metadata = self._run_agent_bind_turn_wiring(
+             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
+         )
+-        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
+-        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
++        # Quiet optional replies retain their real human source and final delivery.
++        if not (scheduled_heartbeat or quiet_optional_reply or turn_ctx.mute_notification_reply):
+             self._run_agent_start_streaming_tts(
+                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
+             )
+@@ -2370,7 +2372,7 @@
+         # Periodic "still working" notifications so the user knows the agent hasn't died.
+         _executor_task_holder: list = [None]  # bound once the executor future exists (see below)
+         _notify_task = (
+-            None if (scheduled_heartbeat or turn_ctx.mute_notification_reply)
++            None if (scheduled_heartbeat or quiet_optional_reply or turn_ctx.mute_notification_reply)
+             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
+         )
+ 
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -225,11 +225,12 @@
+             scfg = StreamingConfig()
+         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
+         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
+-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
++        quiet_optional_reply = platform_key == "napcat" and ctx.reply_expected is False
++        want_stream_deltas = not (ctx.scheduled_heartbeat or quiet_optional_reply) and scfg.enabled_for(plat_streaming)
+         # A finite (`-z`, `chat -q`) viewer prints only the terminal reply, like the classic quiet
+         # CLI that never wired commentary. Commentary it cannot see must not be recorded as a
+         # delivery, or a final that arrives as commentary (codex app-server) suppresses the reply.
+-        want_interim_messages = (bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
++        want_interim_messages = (bool(ctx.interim_assistant_messages_enabled) and not (ctx.scheduled_heartbeat or quiet_optional_reply)
+                                  and not _finite_viewer_turn())
+         if want_stream_deltas or want_interim_messages:
+             try:

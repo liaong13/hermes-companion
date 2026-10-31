@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-napcat"
+version = "0.5.0"
+description = "External fail-closed Hermes OneBot 11 forward WebSocket platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Hermes NapCat contributors"}]
+dependencies = ["aiohttp>=3.12,<4"]
+
+[tool.setuptools]
+packages = ["hermes_napcat"]
+package-dir = {hermes_napcat = "."}
+
+[tool.setuptools.package-data]
+hermes_napcat = ["plugin.yaml"]

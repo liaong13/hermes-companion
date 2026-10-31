@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.stage/
+build/
+dist/
+*.egg-info/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+runtime/
+secrets/
+
+# Local plans and disposable verification fixtures (not release sources)
+/.hermes/plans/
+/.release-check-*/
+/plugins/hermes-napcat/test-host-runtime-*/
+/.local-references/

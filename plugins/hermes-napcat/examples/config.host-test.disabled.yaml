@@ -1,0 +1,43 @@
+# 候选模板：所有号码均为占位，不覆盖已有配置；由父任务审阅并部署。
+plugins:
+  enabled: []
+platforms:
+  napcat:
+    enabled: false
+    gateway_restart_notification: false # strict 模式没有启动通知的入站回复许可
+    extra:
+      ws_url: ws://127.0.0.1:13011
+      self_id: "100000001"
+      owner_id: "100000002"
+      allowed_users: ["100000002"]
+      allowed_groups: ["100000003"]
+      group_admission: all_members # 显式开放这些群的真实成员；不扩大DM或群范围
+      require_mention: true  # 旧配置保留；显式 group_trigger 优先
+      group_trigger:
+        mode: name_or_mention
+        name: 对话伙伴  # 显式示例呼唤名，不定义角色身份
+      typing: false
+      isolation:
+        mode: strict
+        private_profile: default
+        social_profile: social
+        domain_id: napcat-public
+        policy_revision: 2
+        guest_dm_users: []
+      runtime:
+        mode: host_llm
+        contract: 4
+        social_home: /srv/napcat-public-runtime
+      media:
+        enabled: true
+        groups: ["100000003"]
+        types: [image, file]  # 本阶段不开 record/audio/Whisper
+        references: true
+        observe_metadata: true
+        download_policy: public_https # 取消域名过滤；不配置 download_hosts
+        cloud: [image]
+        allow_derived_text: true
+        budget_mode: provider  # 明确不设本地费用额度；供应商 key 额度需现场核实
+# 环境：NAPCAT_ACCESS_TOKEN、OPENROUTER_API_KEY；这里不放任何凭据。
+# 公网模式仍严格 HTTPS/443、TLS、DNS/SSRF、禁代理/重定向及解析沙箱。
+# 取消域名过滤不等于没有网络/解析风险；新策略真实文件与QQ客户端由父任务验收。

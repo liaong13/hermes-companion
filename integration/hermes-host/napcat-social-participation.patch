@@ -1,0 +1,107 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -475,8 +475,8 @@
+ 
+ def _non_conversational_metadata(
+     metadata: Optional[dict[str, Any]] = None, *, platform: Any = None) -> Optional[dict[str, Any]]:
+-    """Mark Discord lifecycle/status sends without changing other platforms."""
+-    if _gateway_platform_value(platform) != "discord":
++    """Mark lifecycle/status sends for adapters that track conversational activity."""
++    if _gateway_platform_value(platform) not in {"discord", "napcat"}:
+         return metadata
+     merged = dict(metadata or {})
+     merged["non_conversational"] = True
+@@ -754,6 +754,7 @@
+ 
+     See #30045.
+     """
++    metadata = _non_conversational_metadata(metadata, platform=getattr(adapter, 'platform', None))
+     sender = getattr(adapter, "send_or_update_status", None)
+     if callable(sender):
+         return await sender(chat_id, status_key, content, metadata=metadata)
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1136,13 +1136,20 @@
+         """Platform context + YAML channel_prompts hint + channel_overrides system_prompt (or global
+         ephemeral) + the gateway ephemeral prompt."""
+         ctx = self._ctx
++        conversation_prompt = ''
++        if ctx.source.platform.value == 'napcat':
++            adapter = self._runner._delivery_adapter_for(ctx.source)
++            supplier = getattr(adapter, 'conversation_prompt_for_source', None)
++            if callable(supplier):
++                conversation_prompt = supplier(ctx.source)
+         if ctx.source.platform.value == "napcat" and ctx.source.chat_type == "group":
+-            return (
++            privacy = (
+                 "这是公开 QQ 群会话。只使用本群已核验的输入和公开网络资料；"
+                 "不得读取或透露私人文件、私聊、密钥或其他群资料。"
+                 "私人请求请引导已验证主人在私聊重新提出。"
+                 "群内工具调用须服从执行时授权；拒绝后不要换路径重试。"
+             )
++            return '\n\n'.join(part for part in (privacy, conversation_prompt) if part)
+         from gateway.session_api_turn import api_execution
+         api = api_execution.get()
+         if api is not None:
+@@ -1154,6 +1161,7 @@
+                 ctx.source.platform, ctx.source.chat_id or "", thread_id=getattr(ctx.source, "thread_id", None),
+                 parent_id=getattr(ctx.source, "parent_chat_id", None),
+             ),
++            conversation_prompt,
+         ):
+             if extra:
+                 combined = (combined + "\n\n" + extra).strip()
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -190,7 +190,7 @@
+ 
+     async def _deliver_platform_notice(self, source, content: str) -> None:
+         """Deliver a setup/operational notice using platform-specific privacy rules."""
+-        from gateway.run import _is_slack_ignored_channel
++        from gateway.run import _is_slack_ignored_channel, _non_conversational_metadata
+         adapter = self._delivery_adapter_for(source)
+         if not adapter:
+             return
+@@ -211,7 +211,7 @@
+                 config.get_notice_delivery(source.platform) if config and hasattr(config, "get_notice_delivery")
+                 else "public"
+             )
+-        metadata = self._thread_metadata_for_source(source)
++        metadata = _non_conversational_metadata(self._thread_metadata_for_source(source), platform=source.platform)
+         if notice_delivery == "private" and getattr(source, "user_id", None):
+             with _log_suppressed(
+                 logging.DEBUG, "[%s] send_private_notice failed, falling back to public",
+--- a/gateway/run_turn_prepare.py
++++ b/gateway/run_turn_prepare.py
+@@ -454,7 +454,7 @@
+ 
+     async def _hmwa_deliver_auto_reset_notice(self, session_entry, source, turn_sidecar_notes):
+         """Stage the auto-reset sidecar note for the agent and notify the user (policy-gated)."""
+-        from gateway.run import _AUTO_RESET_CONTEXT_NOTES
++        from gateway.run import _AUTO_RESET_CONTEXT_NOTES, _non_conversational_metadata
+         reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'suspended'
+         context_note = _AUTO_RESET_CONTEXT_NOTES.get(reset_reason, _AUTO_RESET_CONTEXT_NOTES["suspended"])
+         # Long-lived channels: point the agent at the prior same-channel session for session_search.
+@@ -477,7 +477,8 @@
+                     session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
+                     if session_info:
+                         notice = f"{notice}\n\n{session_info}"
+-                await adapter.send(source.chat_id, notice, metadata=self._thread_metadata_for_source(source))
++                await adapter.send(source.chat_id, notice, metadata=_non_conversational_metadata(
++                    self._thread_metadata_for_source(source), platform=source.platform))
+         except Exception as e:
+             logger.debug("Auto-reset notification failed (non-fatal): %s", e)
+ 
+--- a/gateway/run_turn_persistence.py
++++ b/gateway/run_turn_persistence.py
+@@ -585,7 +585,9 @@
+             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
+             if _footer_line and adapter:
+                 try:
+-                    await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
++                    from gateway.run import _non_conversational_metadata
++                    await adapter.send(source.chat_id, _footer_line, metadata=_non_conversational_metadata(
++                        self._event_thread_metadata(event, source), platform=source.platform))
+                 except Exception as _e:
+                     logger.debug("trailing footer send failed: %s", _e)
+             # Return None so the body isn't sent twice; stash the delivered text on the event for the
